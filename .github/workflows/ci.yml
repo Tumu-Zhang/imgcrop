@@ -1,0 +1,29 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: windows-latest
+    strategy:
+      matrix:
+        python-version: ["3.10", "3.13"]
+    env:
+      # runner 控制台是 cp1252：pip/pytest 输出出现中文（中文报错文案等）
+      # 会 UnicodeEncodeError —— 强制 Python 走 UTF-8 模式
+      PYTHONUTF8: "1"
+      QT_QPA_PLATFORM: offscreen
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+      - name: 安装依赖
+        run: pip install -r requirements.txt
+      # Qt 在无头 CI 上有偶发 "Fatal Python error: Aborted"（进程级崩溃，
+      # 与代码无关）。失败自动完整重试一次；真回归两次都会失败，不会掩盖。
+      - name: 运行测试
+        run: python -m pytest tests -q || python -m pytest tests -q

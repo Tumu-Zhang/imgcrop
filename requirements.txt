@@ -1,0 +1,16 @@
+# 图片裁剪器 —— 运行依赖
+#
+# 安装： pip install -r requirements.txt
+#
+# 说明：
+#   Pillow        图片读写、重采样、DPI 元数据、PNG/JPEG/TIFF 编码
+#   numpy         掩膜与几何运算（连通域、坐标映射）
+#   onnxruntime   跑两个本地分割模型（ISNet 自动找主体、EfficientSAM 点选）
+#   PySide6       桌面界面（拖拽、预览、批量队列、进度）
+#   pytest        开发期测试
+
+Pillow>=10.0
+numpy>=1.26
+onnxruntime>=1.17
+PySide6>=6.5
+pytest>=8.0

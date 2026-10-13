@@ -1,0 +1,29 @@
+# ---- Python ----
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.venv/
+venv/
+
+# ---- 打包产物（用 tools/build.py 重新生成，逢修复必须重打包） ----
+build/
+dist/
+/_internal/
+/图片裁剪器.exe
+# PyInstaller 每次打包重新生成，真正的打包配置在 tools/build.py
+*.spec
+
+# ---- 模型大文件不进 git（README 指引用 tools/fetch_models.py 获取） ----
+models/
+
+# ---- 本地工作资料：部门目录与项目文档，只留本地不上传 ----
+/反馈部/
+/组织部/
+/宣传部/
+/收集部/
+/前辈经验手册.md
+/优化提示词.md
+
+# ---- 工具目录 ----
+.reasonix/
+.workbuddy/

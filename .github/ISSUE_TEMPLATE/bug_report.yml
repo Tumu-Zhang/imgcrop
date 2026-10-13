@@ -1,0 +1,57 @@
+name: Bug 报告
+description: 裁剪/抠图结果不对、界面异常、闪退等问题
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        感谢反馈！请尽量填全下面的信息 —— **附上截图或复现步骤**能让问题更快定位。
+  - type: input
+    id: version
+    attributes:
+      label: 软件版本
+      description: Release 页可查，例如 1.0.0
+    validations:
+      required: true
+  - type: input
+    id: os
+    attributes:
+      label: 操作系统
+      description: 例如 Windows 11 24H2
+    validations:
+      required: true
+  - type: dropdown
+    id: issue-type
+    attributes:
+      label: 问题类型
+      options:
+        - 裁剪 / 抠图结果不对
+        - AI 分割不可用或报错
+        - 界面显示异常
+        - 启动失败或闪退
+        - 其他 / 不确定
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: 复现步骤
+      description: 怎么操作会出现问题？
+      placeholder: |
+        1. 拖入 xxx.png
+        2. 拉出裁剪框，点「应用」
+        3. 输出结果不对 / 报错
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: 期望与实际
+      description: 你期望的结果 vs 实际发生的事
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: 截图或日志
+      description: 界面截图、报错弹窗或日志内容（如有）

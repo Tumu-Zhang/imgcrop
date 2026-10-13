@@ -1,0 +1,16 @@
+name: 功能建议
+description: 希望支持的新功能、新参数或界面改进
+labels: ["enhancement"]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: 想解决的问题
+      description: 现在卡在哪？例如「想按固定比例批量裁剪，目前要一个个手动拉框」
+    validations:
+      required: true
+  - type: textarea
+    id: idea
+    attributes:
+      label: 期望的方案
+      description: 你希望它怎么工作？有参考的工具也可以贴出来
