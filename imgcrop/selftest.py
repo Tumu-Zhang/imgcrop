@@ -2,7 +2,7 @@
 
 打包最容易坏的两件事是「资源没带上」和「原生库没配好」—— 它们都不会在
 源码运行时报错。所以这里刻意跑真实流程：合成图 -> 自动主体框 -> 裁剪 ->
-重采样 -> 编码落盘 -> 回读校验，最后再确认模型与 onnxruntime 真的可用。
+1:1 落盘 -> 回读校验，最后再确认模型与 onnxruntime 真的可用。
 
 用法::
 
@@ -21,7 +21,7 @@ from PIL import Image, ImageDraw
 
 from imgcrop.crop import CropMode, CropSpec
 from imgcrop.geometry import Box, mask_to_box
-from imgcrop.model import OutputFormat, OutputSpec, SizeMode
+from imgcrop.model import OutputSpec
 from imgcrop.pipeline import CropPlan, Cropper
 
 # 合成图的构图：白底 + 居中的深色主体块，模拟"浅底上放着一个样品"
@@ -44,14 +44,14 @@ def _make_sample(path: Path) -> None:
 
 
 def _check_crop(workdir: Path) -> str:
+    """裁剪 -> 1:1 落盘 -> 回读校验。
+
+    1.1.0 起输出不再重采样：成品尺寸 = 裁剪窗尺寸 = 主体 x (1+2*margin)。
+    """
     source = workdir / "sample.png"
     _make_sample(source)
 
     spec = OutputSpec(
-        size_mode=SizeMode.PIXELS,
-        px_width=800,
-        dpi=300,
-        fmt=OutputFormat.PNG,
         output_dir=workdir / "out",
         name_template="{stem}_crop",
     )
@@ -68,41 +68,86 @@ def _check_crop(workdir: Path) -> str:
     if not out_path.is_file():
         raise CheckFailed(f"没有生成输出文件：{out_path}")
 
+    expected = (round(400 * 1.16), round(300 * 1.16))  # 464 x 348
     with Image.open(out_path) as produced:
         produced.load()
         width, height = produced.size
         center = produced.convert("RGB").getpixel((width // 2, height // 2))
         dpi = produced.info.get("dpi")
+        mode = produced.mode
 
-    if width != 800:
-        raise CheckFailed(f"输出宽度应为 800，实际 {width}")
-    if height <= 0:
-        raise CheckFailed(f"输出高度异常：{height}")
+    if out_path.suffix != ".png":
+        raise CheckFailed(f"PNG 源应输出 PNG（格式跟随源），实际 {out_path.suffix}")
+    if (width, height) != expected:
+        raise CheckFailed(f"输出应为裁剪窗原像素 {expected}，实际 {width}x{height}")
     # 主体应当被裁到画面正中：中心像素必须是主体色而不是背景色
     if sum(abs(a - b) for a, b in zip(center, SUBJECT_COLOR)) > 60:
         raise CheckFailed(f"画面中心不是主体（取到 {center}，应为 {SUBJECT_COLOR} 附近）")
-    if dpi and abs(float(dpi[0]) - 300) > 1:
-        raise CheckFailed(f"DPI 元数据应为 300，实际 {dpi}")
+    if not dpi or abs(float(dpi[0]) - 300) > 1:
+        raise CheckFailed(f"DPI 元数据应缺省 300，实际 {dpi}")
+    if mode != "RGB":
+        raise CheckFailed(f"不带透明的源应输出 RGB，实际 {mode}")
 
-    return f"裁剪输出 {width}x{height} @ {dpi or '无 dpi 元数据'}"
+    return f"输出 {width}x{height}（1:1）@ {dpi or '无 dpi 元数据'}"
+
+
+def _check_format_follows_source(workdir: Path) -> str:
+    """D6：JPG 源 -> JPG 输出。"""
+    source = workdir / "sample.jpg"
+    _make_sample(source)
+
+    spec = OutputSpec(output_dir=workdir / "out", name_template="{stem}_fmt")
+    plan = CropPlan(
+        spec=CropSpec(mode=CropMode.SUBJECT, subject=SUBJECT, margin=0.08, origin="自检")
+    )
+    report = Cropper(spec, crop_provider=lambda _p: plan).run([source])
+    if report.fail_count or not report.ok_count:
+        failure = report.results[0] if report.results else None
+        raise CheckFailed(f"JPG 裁剪失败：{getattr(failure, 'error', '没有任何结果')}")
+
+    out_path = report.results[0].out_path
+    assert out_path is not None
+    if out_path.suffix != ".jpg":
+        raise CheckFailed(f"JPG 源应输出 JPG，实际 {out_path.suffix}")
+    return "JPG 源 -> JPG 输出"
+
+
+def _check_transparency(workdir: Path) -> str:
+    """D6：带透明的 PNG 源 -> PNG 输出保留透明通道。"""
+    source = workdir / "alpha.png"
+    Image.new("RGBA", (200, 160), (200, 30, 60, 120)).save(source)
+
+    spec = OutputSpec(output_dir=workdir / "out", name_template="{stem}_alpha")
+    plan = CropPlan(
+        spec=CropSpec(mode=CropMode.FREE, subject=Box(10, 10, 190, 150), origin="自检")
+    )
+    report = Cropper(spec, crop_provider=lambda _p: plan).run([source])
+    if report.fail_count or not report.ok_count:
+        failure = report.results[0] if report.results else None
+        raise CheckFailed(f"透明图裁剪失败：{getattr(failure, 'error', '没有任何结果')}")
+
+    out_path = report.results[0].out_path
+    assert out_path is not None
+    with Image.open(out_path) as produced:
+        produced.load()
+        mode = produced.mode
+    if mode != "RGBA":
+        raise CheckFailed(f"带透明的 PNG 源应输出 RGBA（保透明），实际 {mode}")
+    return "PNG 透明通道保留"
 
 
 def _check_quad(workdir: Path) -> str:
+    """D9 融合管线：quad 正交前置 + mode=NONE 时拉平结果就是成品。"""
     source = workdir / "quad.png"
     Image.new("RGB", (600, 400), (200, 210, 220)).save(source)
 
     spec = OutputSpec(
-        size_mode=SizeMode.PIXELS,
-        px_width=300,
-        px_height=200,
-        keep_aspect=False,
-        fmt=OutputFormat.PNG,
         output_dir=workdir / "out",
         name_template="{stem}_quad",
     )
     plan = CropPlan(
         spec=CropSpec(
-            mode=CropMode.QUAD,
+            mode=CropMode.NONE,
             quad=[(0.0, 0.0), (600.0, 0.0), (600.0, 400.0), (0.0, 400.0)],
             quad_size=(300, 200),
         )
@@ -137,9 +182,6 @@ def _check_rotation(workdir: Path) -> str:
         raise CheckFailed("合成倾斜主体失败（没得到掩膜框）")
 
     spec = OutputSpec(
-        size_mode=SizeMode.PIXELS,
-        px_width=600,
-        fmt=OutputFormat.PNG,
         output_dir=workdir / "out",
         name_template="{stem}_straight",
     )
@@ -183,6 +225,46 @@ def _check_rotation(workdir: Path) -> str:
     return f"按 -12° 转正后主体仍是一条 {width}x{height} 的细长条"
 
 
+def _check_auto_quad(workdir: Path) -> str:
+    """UI-007 自动选角：斜矩形掩膜 → 四角估计 → 拉平输出与真值一致。"""
+    source = workdir / "tilted_doc.png"
+    layer = Image.new("L", (800, 600), 0)
+    ImageDraw.Draw(layer).rectangle([200, 150, 600, 450], fill=255)
+    layer = layer.rotate(10.0, resample=Image.Resampling.BICUBIC, fillcolor=0)
+    image = Image.new("RGB", (800, 600), (48, 52, 58))
+    image.paste((236, 232, 224), mask=layer)
+    image.save(source)
+    mask = np.asarray(layer) > 127
+
+    from imgcrop.geometry import quad_from_mask, quad_output_size
+
+    quad = quad_from_mask(mask)
+    if quad is None:
+        raise CheckFailed("自动选角没能从斜矩形掩膜估出四边形")
+    expected = quad_output_size(list(quad))
+    if abs(expected[0] - 400) > 8 or abs(expected[1] - 300) > 8:
+        raise CheckFailed(
+            f"自动估出的拉平尺寸 {expected} 偏离真值矩形 400x300 太远"
+        )
+
+    plan = CropPlan(spec=CropSpec(mode=CropMode.NONE, quad=quad))
+    report = Cropper(
+        OutputSpec(output_dir=workdir / "out", name_template="{stem}_auto"),
+        crop_provider=lambda _p: plan,
+    ).run([source])
+    if report.fail_count or not report.ok_count:
+        failure = report.results[0] if report.results else None
+        raise CheckFailed(f"自动选角拉平失败：{getattr(failure, 'error', '没有任何结果')}")
+    out_path = report.results[0].out_path
+    assert out_path is not None
+    with Image.open(out_path) as produced:
+        produced.load()
+        size = produced.size
+    if size != expected:
+        raise CheckFailed(f"拉平输出 {size} 与估计尺寸 {expected} 不一致")
+    return f"斜矩形自动选角 -> 拉平输出 {size[0]}x{size[1]}"
+
+
 def _check_models() -> str:
     """确认模型文件与 onnxruntime 在打包后依然可用。"""
     from imgcrop import models
@@ -215,8 +297,11 @@ def main(argv: list[str] | None = None) -> int:
     print("图片裁剪器 自检")
     print("=" * 40)
     steps = (
-        ("裁剪 → 重采样 → 编码落盘", _check_crop),
+        ("裁剪 -> 1:1 落盘 -> 回读校验", _check_crop),
+        ("格式跟随源（JPG -> JPG）", _check_format_follows_source),
+        ("PNG 透明通道保留", _check_transparency),
         ("四点透视矫正", _check_quad),
+        ("自动选角（掩膜 -> 四角 -> 拉平）", _check_auto_quad),
         ("旋转后裁剪", _check_rotation),
     )
 

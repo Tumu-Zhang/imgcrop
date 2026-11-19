@@ -3,8 +3,12 @@
 这里只处理栅格图（PNG / JPEG / TIFF / BMP / WebP …）。裁剪器不渲染 PDF 或
 幻灯片 —— 那类需求请先用「图片转换器」导出成图片，再拿过来裁。
 
-载入时会把各种麻烦的模式统一掉（透明通道合成白底、索引色调色板转 RGB、
-CMYK 转 RGB、16 位保持高位深），这样后续的裁剪与编码只需面对少数几种模式。
+载入时会把各种麻烦的模式统一掉（索引色调色板转 RGB、CMYK 转 RGB、16 位保持
+高位深），这样后续的裁剪与编码只需面对少数几种模式。
+
+透明通道（1.1.0 起，D6 定案）：PNG 等带 alpha 的源**保留 RGBA**——
+输出跟随源格式时 PNG→PNG 才能保住透明。JPEG 输出由编码层负责把透明区
+合成到白底（encode._flatten_rgba）。
 """
 
 from __future__ import annotations
@@ -54,17 +58,16 @@ def load_raster(path: Path | str) -> LoadedImage:
         warnings.append("多帧文件仅取第 1 帧")
 
     mode = img.mode
-    if mode in ("RGBA", "LA", "PA"):
-        background = Image.new("RGB", img.size, (255, 255, 255))
-        alpha = img.convert("RGBA")
-        background.paste(alpha, mask=alpha.split()[-1])
-        img = background
-        warnings.append("源图含透明通道，已合成到白色背景")
-    elif mode == "P":
+    has_alpha = mode in ("RGBA", "LA", "PA") or (
+        mode == "P" and "transparency" in img.info
+    )
+    if has_alpha:
+        # D6：PNG→PNG 保透明 —— 带透明的源保留 RGBA 链路，
+        # 只有编码成 JPEG 时才在编码层合成白底。
         img = img.convert("RGBA")
-        background = Image.new("RGB", img.size, (255, 255, 255))
-        background.paste(img, mask=img.split()[-1])
-        img = background
+        warnings.append("源图含透明通道，输出 PNG 时将保留透明")
+    elif mode == "P":
+        img = img.convert("RGB")
         warnings.append("索引色调色板图已转换为 RGB")
     elif mode == "CMYK":
         img = img.convert("RGB")

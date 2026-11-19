@@ -29,7 +29,7 @@
 from __future__ import annotations
 
 from PySide6.QtCore import QPointF, QRectF, Qt, Signal
-from PySide6.QtGui import QColor, QPainter, QPainterPath, QPen, QPixmap
+from PySide6.QtGui import QColor, QPainter, QPainterPath, QPen, QPixmap, QPolygonF
 from PySide6.QtWidgets import QWidget
 
 from imgcrop.geometry import Box
@@ -39,6 +39,12 @@ from gui import theme
 
 HANDLE_PX = 9.0
 """手柄的显示边长（控件像素）。"""
+
+QUAD_HANDLE_PX = 11.0
+"""透视拉平角点的显示半径（控件像素）—— 比框手柄大一档，四个点不好抓太小。"""
+
+QUAD_HIT_PX = 22.0
+"""角点的命中半径（控件像素）。"""
 
 MIN_DISPLAY_PX = 24.0
 """框在屏幕上至少要这么大，否则很难再抓住。"""
@@ -73,6 +79,8 @@ class CropCanvas(QWidget):
     pickRequested = Signal(float, float)  # 点选模式下的点击（原图坐标）
     resetRequested = Signal()             # 双击画布，希望回到自动结果
     cycleRequested = Signal()             # 在智能取景下点一下空白处，切换下一个候选
+    quadChanged = Signal(list)            # 四角拉平：拖动中的四个角点（原图坐标）
+    quadCommitted = Signal(list)          # 四角拉平：松手时的四个角点（原图坐标）
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
@@ -87,6 +95,10 @@ class CropCanvas(QWidget):
         self._picks: list[tuple[float, float]] = []
         self._pick_labels: list[float] = []
         self._pick_mode = False
+
+        self._quad_mode = False
+        self._quad_points: list[QPointF] | None = None
+        self._quad_drag_index: int | None = None
 
         self._drag: str | None = None
         self._drag_handle: str | None = None
@@ -142,6 +154,58 @@ class CropCanvas(QWidget):
     @property
     def pick_mode(self) -> bool:
         return self._pick_mode
+
+    # -- 四角拉平（透视矫正） -------------------------------------------
+    @property
+    def quad_mode(self) -> bool:
+        return self._quad_mode
+
+    @property
+    def quad_points(self) -> list[tuple[float, float]] | None:
+        """当前的四个角点（原图坐标，直观顺序 左上/右上/右下/左下）。"""
+        if self._quad_points is None:
+            return None
+        return [(point.x(), point.y()) for point in self._quad_points]
+
+    def set_quad_mode(self, enabled: bool) -> None:
+        """进入/退出四角拉平编辑态。进入时若还没有角点，按画面内缩 12% 摆初始四点。"""
+        self._quad_mode = enabled
+        self._quad_drag_index = None
+        self._hover_handle = None
+        if enabled:
+            if self._quad_points is None:
+                self._quad_points = self._default_quad_points()
+            self._hover_cursor = Qt.CrossCursor
+        else:
+            self._quad_points = None
+            self._hover_cursor = Qt.ArrowCursor
+        self.setCursor(self._hover_cursor)
+        self.update()
+
+    def reset_quad_points(self) -> None:
+        """把四个角点放回默认位置（重新开始框）。"""
+        if self._quad_mode:
+            self._quad_points = self._default_quad_points()
+            self.update()
+
+    def set_quad_points(self, points) -> None:
+        """用给定的一组角点（原图坐标）替换当前四点（重新编辑已存的 quad 时用）。"""
+        if not self._quad_mode or points is None or len(points) != 4:
+            return
+        self._quad_points = [QPointF(float(x), float(y)) for x, y in points]
+        self.update()
+
+    def _default_quad_points(self) -> list[QPointF] | None:
+        width, height = self._image_size
+        if width <= 1 or height <= 1:
+            return None
+        inset_x, inset_y = width * 0.12, height * 0.12
+        return [
+            QPointF(inset_x, inset_y),
+            QPointF(width - inset_x, inset_y),
+            QPointF(width - inset_x, height - inset_y),
+            QPointF(inset_x, height - inset_y),
+        ]
 
     @property
     def picks(self) -> list[tuple[float, float]]:
@@ -246,6 +310,11 @@ class CropCanvas(QWidget):
         painter.setRenderHint(QPainter.SmoothPixmapTransform, True)
         painter.drawPixmap(target, self._pixmap, QRectF(self._pixmap.rect()))
 
+        # 四角拉平编辑态：压暗四边形外部 + 亮边四边形 + 角点手柄
+        if self._quad_mode and self._quad_points is not None:
+            self._draw_quad_editor(painter, palette)
+            return
+
         # 主体轮廓：虚线框 + 轻微填充，让用户看到"识别到了什么"
         if self._subject is not None:
             subject_rect = self._to_widget(self._subject)
@@ -279,6 +348,33 @@ class CropCanvas(QWidget):
                     QPointF(point.x() - 3.0, point.y() + 3.0),
                     QPointF(point.x() + 3.0, point.y() - 3.0),
                 )
+
+    def _draw_quad_editor(self, painter: QPainter, palette) -> None:
+        """四角拉平编辑态：让"这四个角围住的区域"一眼看清。"""
+        assert self._quad_points is not None
+        polygon = QPolygonF(
+            [self._point_to_widget(x, y) for x, y in self.quad_points or []]
+        )
+
+        # 拉平区域外压暗
+        outer = QPainterPath()
+        outer.addRect(QRectF(self.rect()))
+        quad_path = QPainterPath()
+        quad_path.addPolygon(polygon)
+        quad_path.closeSubpath()
+        painter.fillPath(outer.subtracted(quad_path), palette.frame_shade)
+
+        # 四边形亮边
+        painter.setBrush(Qt.NoBrush)
+        painter.setPen(QPen(palette.frame_line, 2.0))
+        painter.drawPolygon(polygon)
+
+        # 角点：白底圆点 + 强调色描边，拖动中的那个放大
+        for index, point in enumerate(polygon):
+            radius = QUAD_HANDLE_PX * (1.3 if index == self._quad_drag_index else 1.0)
+            painter.setBrush(palette.handle_fill)
+            painter.setPen(QPen(palette.handle_edge, 1.8))
+            painter.drawEllipse(point, radius, radius)
 
     def _draw_empty_state(self, painter: QPainter, palette) -> None:
         """没有图片时的空状态：明确告诉用户可以拖放或点击添加。"""
@@ -393,6 +489,16 @@ class CropCanvas(QWidget):
         if self._pixmap is None:
             return
 
+        # ---- 四角拉平编辑态：只响应角点拖动，其它手势一律让位 ----
+        if self._quad_mode:
+            if event.button() != Qt.LeftButton or self._quad_points is None:
+                return
+            position = event.position()
+            index = self._hit_quad_handle(position)
+            if index is not None:
+                self._quad_drag_index = index
+            return
+
         if event.button() == Qt.RightButton:
             if self._pick_mode:
                 source = self._to_source(event.position().x(), event.position().y())
@@ -442,6 +548,21 @@ class CropCanvas(QWidget):
     def mouseMoveEvent(self, event) -> None:  # noqa: N802
         position = event.position()
 
+        # ---- 四角拉平：拖动命中的那个角点 ----
+        if self._quad_mode:
+            if self._quad_drag_index is None or self._quad_points is None:
+                hover = self._hit_quad_handle(position)
+                if hover != self._hover_handle:
+                    self._hover_handle = hover
+                    self.setCursor(Qt.CrossCursor if hover is not None else Qt.ArrowCursor)
+                    self.update()
+                return
+            source = self._clamp_point(self._to_source(position.x(), position.y()))
+            self._quad_points[self._quad_drag_index] = source
+            self.update()
+            self.quadChanged.emit(self.quad_points)
+            return
+
         if self._drag is None:
             self._update_hover(position)
             return
@@ -486,6 +607,15 @@ class CropCanvas(QWidget):
             self.boxChanged.emit(current)
 
     def mouseReleaseEvent(self, event) -> None:  # noqa: N802
+        # ---- 四角拉平：松手提交四个角点 ----
+        if self._quad_mode:
+            if self._quad_drag_index is not None and self._quad_points is not None:
+                self._quad_drag_index = None
+                self.update()
+                if self.quad_points:
+                    self.quadCommitted.emit(self.quad_points)
+            return
+
         drag = self._drag
         start = self._drag_start
         previous_box = self._drag_box
@@ -548,6 +678,16 @@ class CropCanvas(QWidget):
         source = self._to_source(event.position().x(), event.position().y())
         if self._inside_image(source):
             self.resetRequested.emit()
+
+    def _hit_quad_handle(self, position: QPointF) -> int | None:
+        """命中测试：返回被按住的那个角点下标（控件坐标距离）。"""
+        if self._quad_points is None:
+            return None
+        for index, (x, y) in enumerate(self.quad_points or []):
+            widget_point = self._point_to_widget(x, y)
+            if (widget_point - position).manhattanLength() <= QUAD_HIT_PX:
+                return index
+        return None
 
     def _resize(self, base: QRectF, handle: str | None, source: QPointF) -> QRectF:
         left, top, right, bottom = base.left(), base.top(), base.right(), base.bottom()

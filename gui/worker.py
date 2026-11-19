@@ -130,6 +130,11 @@ class ExportWorker(QObject):
         self._paths = list(paths)
         self._plans = plans
         self._spec = spec
+        self._cancelled = False
+
+    def cancel(self) -> None:
+        """请求取消：在下一张图的边界停下，已完成的结果保留（P0-2）。"""
+        self._cancelled = True
 
     @Slot()
     def run(self) -> None:
@@ -140,6 +145,7 @@ class ExportWorker(QObject):
                 progress=lambda event: self.progress.emit(
                     event.completed, event.total, event.current
                 ),
+                should_cancel=lambda: self._cancelled,
             ).run(self._paths)
         except Exception as exc:  # noqa: BLE001 - 兜住一切，避免线程静默死亡
             self.failed.emit(f"{type(exc).__name__}: {exc}")

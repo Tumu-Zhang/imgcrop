@@ -2,7 +2,7 @@
 
 本模块坐在几何内核（geometry）与输出管线（pipeline / encode）之间：
 geometry 只算坐标，本模块负责按规格取出图像区域，之后交给 model.OutputSpec
-去决定最终像素尺寸、DPI 与格式。
+去决定落盘方式（1.1.0 起输出 = 裁剪窗原像素，1:1，格式跟随源）。
 
 主体框从哪来
 ------------
@@ -12,13 +12,21 @@ geometry 只算坐标，本模块负责按规格取出图像区域，之后交�
 
 批内一致
 --------
-一致性由两件事共同保证，都不需要预先扫描整批：
+一致性由"主体归一化取景"保证（见 geometry.frame_for_subject）：
+画面尺寸 = 主体尺寸 x (1 + 2 x 边距)，主体占比只由参数决定，
+与拍摄远近无关。输出不再重采样（1:1），因此成品像素随裁剪窗走。
 
-1. 取景用 frame_for_subject：画面尺寸 = 主体尺寸 x (1 + 2 x 边距)，
-   所以主体占比只由参数决定，与拍摄远近无关。
-2. 输出分辨率由 OutputSpec 的像素模式固定，与源图大小无关。
+矫正管线（1.1.0，D9 融合定案）
+------------------------------
+quad（四点透视拉平）是**正交前置步骤**，不是独立的取景模式：
 
-因此本模块可以保持逐文件流式处理，不必等整批都读进来。
+    透视拉平 -> 自动转正/手动旋转 -> 取景（三模式不变）
+
+quad 一旦给定，apply_crop 先把源图上的四边形拉成正视矩形，此后的旋转、
+取景全部作用在拉平结果上；mode=NONE 时拉平结果本身就是成品。
+纪律：quad 用**原图坐标**；quad 给定后主体框等坐标都在拉平图坐标系里
+（GUI 用 quad_homography 做映射）；quad 与 rectify_tilt 互斥 —— 掩膜在
+原图空间，拉平后坐标系对不上，强行叠加只会算歪。
 """
 
 from __future__ import annotations
@@ -63,19 +71,16 @@ ASPECT_PRESETS: tuple[tuple[str, float | None], ...] = (
 
 
 class CropMode(str, Enum):
-    """裁剪方式。"""
+    """裁剪方式（透视拉平由 quad 字段承担，不占模式位）。"""
 
     NONE = "none"
-    """不裁剪，原图原样进入后续的尺寸/格式处理。"""
+    """不取景。quad 给定时拉平结果就是成品（"只拉平、不二次取景"）。"""
 
     SUBJECT = "subject"
     """按主体取景：以主体框为基准，按 margin 与 aspect 扩张出裁剪窗。"""
 
     FREE = "free"
     """自由框选：给什么框就裁什么框，不再加边距（用户直接拖出来的框）。"""
-
-    QUAD = "quad"
-    """四点透视矫正：把任意四边形拉成正视矩形。"""
 
 
 @dataclass
@@ -89,10 +94,18 @@ class CropSpec:
     mode: CropMode = CropMode.NONE
 
     subject: Box | None = None
-    """主体框（原图坐标系）。SUBJECT 用它取景；FREE 直接拿它当裁剪窗。"""
+    """主体框。SUBJECT 用它取景；FREE 直接拿它当裁剪窗。
+
+    坐标系：quad 为 None 时是**原图坐标**；quad 给定时是**拉平图坐标**
+    （调用方负责用 quad_homography 做映射，见 geometry）。
+    """
 
     quad: Sequence[tuple[float, float]] | None = None
-    """手动四点（原图坐标系，任意顺序）。仅 QUAD 模式使用。"""
+    """四点透视拉平（**原图坐标**，直观顺序 左上/右上/右下/左下）。
+
+    正交前置步骤：给定后先拉平，再走旋转与取景；mode=NONE 时拉平结果
+    就是成品。与 rectify_tilt 互斥（掩膜坐标系对不上）。
+    """
 
     margin: float = DEFAULT_MARGIN
     """相对主体尺寸的留白比例，0.08 即每边 8%。"""
@@ -101,13 +114,13 @@ class CropSpec:
     """目标宽高比；None 表示跟随主体形状。"""
 
     quad_size: tuple[int, int] | None = None
-    """四点矫正的输出尺寸；None 表示按四边形边长自动估算。"""
+    """拉平的输出尺寸；None 表示按四边形边长自动估算。"""
 
     rectify_tilt: bool = False
-    """是否按主体长轴自动纠正倾斜（需要提供掩膜）。"""
+    """是否按主体长轴自动纠正倾斜（需要提供掩膜）。quad 给定时无效。"""
 
     rotate_deg: float = 0.0
-    """手动旋转角（度，正 = 逆时针）。
+    """手动旋转角（度，正 = 逆时针），±180°（D8 定案）。
 
     与 rectify_tilt **叠加**：勾了自动转正就先按主体长轴转正，再叠这个手动
     角度微调。两者都作用在"画面"上 —— 转完之后仍然按轴对齐的矩形取景，
@@ -135,7 +148,7 @@ class CropSpec:
 
     @property
     def enabled(self) -> bool:
-        return self.mode is not CropMode.NONE
+        return self.mode is not CropMode.NONE or self.quad is not None
 
     def validate(self) -> None:
         """规格自检。错误用 SpecError 抛出，交给管线按"单文件失败"处理。"""
@@ -151,29 +164,40 @@ class CropSpec:
             raise SpecError("旋转角度必须是有限数值")
         if abs(self.rotate_deg) > 180.0:
             raise SpecError("旋转角度请控制在 ±180° 以内")
-        if self.mode in (CropMode.SUBJECT, CropMode.FREE):
-            if self.subject is None or self.subject.is_empty:
-                raise SpecError("尚未确定主体范围，无法裁剪")
-        elif self.mode is CropMode.QUAD:
-            if not self.quad or len(self.quad) != 4:
-                raise SpecError("四点矫正需要恰好 4 个点")
+        if self.quad is not None:
+            if len(self.quad) != 4:
+                raise SpecError("透视拉平需要恰好 4 个点")
             try:
                 order_quad(self.quad)  # 顺便校验四点不退化
             except ValueError as exc:
-                raise SpecError(f"四点矫正的角点无效：{exc}") from exc
+                raise SpecError(f"透视拉平的角点无效：{exc}") from exc
+            if self.rectify_tilt:
+                raise SpecError(
+                    "透视拉平与自动转正不能同时用：掩膜在原图坐标系，拉平后对不上"
+                )
+        if self.mode in (CropMode.SUBJECT, CropMode.FREE):
+            if self.subject is None or self.subject.is_empty:
+                raise SpecError("尚未确定主体范围，无法裁剪")
 
     def describe(self) -> str:
         if not self.enabled:
             return "不裁剪"
-        if self.mode is CropMode.QUAD:
+        parts: list[str] = []
+        if self.quad is not None:
             size = f"{self.quad_size[0]}x{self.quad_size[1]}" if self.quad_size else "按边长"
-            return f"四点透视矫正（输出 {size}）"
-        share = 1.0 / (1.0 + 2.0 * self.margin)
+            parts.append(f"透视拉平（{size}）")
+            if self.mode is CropMode.NONE:
+                return parts[0]
+        if self.mode is CropMode.FREE:
+            parts.append("自由框选")
+        else:
+            share = 1.0 / (1.0 + 2.0 * self.margin)
+            parts.append(f"按主体取景（主体占 {share:.0%}）")
         ratio = "跟随主体" if self.aspect is None else f"{self.aspect:.3f}"
-        head = "自由框选" if self.mode is CropMode.FREE else f"按主体取景（主体占 {share:.0%}）"
+        text = " + ".join(parts)
         if abs(self.rotate_deg) > 1e-6:
-            head += f"，旋转 {self.rotate_deg:+.1f}°"
-        return f"{head}，比例 {ratio}"
+            text += f"，旋转 {self.rotate_deg:+.1f}°"
+        return f"{text}，比例 {ratio}"
 
 
 @dataclass
@@ -182,7 +206,7 @@ class CropOutcome:
 
     image: Image.Image
     box: Box | None
-    """实际生效的裁剪窗（已平移到原图坐标系）。QUAD 模式为 None。"""
+    """实际生效的裁剪窗（拉平/旋转后的坐标系）。只拉平不取景时为 None。"""
 
     exact_scale: bool
     """是否严格满足"主体长边占画面长边 = 1/(1+2*margin)"。"""
@@ -225,7 +249,7 @@ def planned_box(
     margin: float = DEFAULT_MARGIN,
     aspect: float | None = None,
 ) -> Box:
-    """算出 SUBJECT 模式最终会裁出的窗口（原图坐标系）。
+    """算出 SUBJECT 模式最终会裁出的窗口（当前工作图坐标系）。
 
     界面要"所见即所得"就必须先知道这个框 —— 与 apply_crop 内部用的是同一个
     frame_for_subject，所以预览和成品不会各算一套。
@@ -249,10 +273,16 @@ def planned_rotation(
     约定就断了。
 
     mask 必须是**原图空间**的掩膜（见 segment.Proposal.source_mask）。
+    quad 给定时自动转正不生效（掩膜坐标系与拉平图对不上，见 validate）。
     """
     warnings: list[str] = []
     auto = 0.0
-    if spec.rectify_tilt and mask is not None and spec.mode is CropMode.SUBJECT:
+    if (
+        spec.rectify_tilt
+        and spec.quad is None
+        and mask is not None
+        and spec.mode is CropMode.SUBJECT
+    ):
         measured = mask_angle(mask)
         mask_box = mask_to_box(mask)
         if mask_box is not None and tilt_is_meaningful(mask_box, measured):
@@ -299,15 +329,17 @@ def apply_crop(
     if mask is not None:
         mask = fit_mask(mask, image.size)
 
-    # ---- 四点透视：一条完全独立的路径，不走主体取景 ----
-    if spec.mode is CropMode.QUAD:
-        assert spec.quad is not None
-        out = rectify_quad(image, spec.quad, spec.quad_size)
-        warnings.append("已按四点做透视矫正")
-        return CropOutcome(image=out, box=None, exact_scale=True, warnings=warnings)
+    work_image = image
 
-    subject = spec.subject
-    assert subject is not None
+    # ---- 透视拉平：正交前置步骤（D9 融合管线的第一段） ----
+    # quad 用原图坐标；拉平后 subject 等坐标都在拉平图坐标系里（调用方映射）。
+    if spec.quad is not None:
+        assert spec.quad is not None
+        work_image = rectify_quad(image, spec.quad, spec.quad_size)
+        warnings.append("已按四点透视拉平")
+        if spec.mode is CropMode.NONE:
+            # 只拉平不取景：拉平结果就是成品
+            return CropOutcome(image=work_image, box=None, exact_scale=True, warnings=warnings)
 
     # ---- 旋转：自动转正（按主体长轴）与手动角度叠加，作用在"画面"上 ----
     # 转完之后仍然按轴对齐矩形取景，所以成品永远是正的。
@@ -315,13 +347,16 @@ def apply_crop(
     warnings.extend(rotation_warnings)
     total_angle = normalize_angle(auto_angle + manual_angle)
 
-    work_image = image
+    subject = spec.subject
+    assert subject is not None
+
     if abs(total_angle) > 1e-6:
-        work_image = rotate_image(image, total_angle, spec.background)
+        pre_rotation_size = work_image.size
+        work_image = rotate_image(work_image, total_angle, spec.background)
         # 框跟着画面一起转 —— 但界面传来的框已经在转正后的画面上摆好了
         # （box_in_rotated_frame），再转一次就错位了。
         if not spec.box_in_rotated_frame:
-            subject = rotate_box(subject, image.size, work_image.size, total_angle)
+            subject = rotate_box(subject, pre_rotation_size, work_image.size, total_angle)
         warnings.append(_rotation_note(auto_angle, manual_angle))
 
     # ---- 取景 ----
@@ -335,7 +370,7 @@ def apply_crop(
                 "这张图的主体占比会比同批略小"
             )
 
-    # 归一化取景下裁剪窗可能越出原图，补背景而不是把窗缩回来 ——
+    # 归一化取景下裁剪窗可能越出工作图边界，补背景而不是把窗缩回来 ——
     # 缩回来会破坏批内一致的主体占比，补背景只是多一圈留白。
     if frame.needs_padding(work_image.size):
         work_image, shifted = pad_to_frame(work_image, frame.box, spec.background)

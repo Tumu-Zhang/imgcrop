@@ -106,7 +106,7 @@ class Palette:
     grid_line: QColor
 
 
-# 浅色主题：Google 的干净灰底 + 纯白卡片 + Google 蓝
+# 浅色主题：Google 的干净灰底 + 纯白卡片 + 强调蓝（D1 定案：#0969da 系）
 LIGHT = Palette(
     name="light",
     dark=False,
@@ -122,15 +122,15 @@ LIGHT = Palette(
     control_border="#dadce0",
     control_border_hover="#bdc1c6",
     divider="#e8eaed",
-    accent="#1a73e8",
-    accent_hover="#1765cc",
-    accent_pressed="#185abc",
-    accent_light="#e8f0fe",
-    selection_bg="#e8f0fe",
+    accent="#0969da",
+    accent_hover="#0550ae",
+    accent_pressed="#033d8a",
+    accent_light="#ddf4ff",
+    selection_bg="#ddf4ff",
     danger="#d93025",
     warning="#e37400",
     success="#188038",
-    info="#1a73e8",
+    info="#0969da",
     canvas_bg=QColor("#202124"),
     canvas_frame=QColor("#5f6368"),
     frame_line=QColor(255, 255, 255, 245),
@@ -138,15 +138,15 @@ LIGHT = Palette(
     subject_line=QColor(251, 188, 4, 235),
     subject_fill=QColor(251, 188, 4, 36),
     handle_fill=QColor(255, 255, 255),
-    handle_edge=QColor("#1a73e8"),
+    handle_edge=QColor("#0969da"),
     pick_mark=QColor("#d93025"),
     pick_mark_ring=QColor(255, 255, 255, 220),
-    pick_negative=QColor("#1a73e8"),
+    pick_negative=QColor("#0969da"),
     pick_negative_ring=QColor(255, 255, 255, 220),
     grid_line=QColor(255, 255, 255, 55),
 )
 
-# 深色主题：Google 深灰（#202124 系）+ 浅蓝强调
+# 深色主题：Google 深灰（#202124 系）+ 浅蓝强调（D1 定案：#58a6ff 系）
 DARK = Palette(
     name="dark",
     dark=True,
@@ -162,15 +162,15 @@ DARK = Palette(
     control_border="#5f6368",
     control_border_hover="#80868b",
     divider="#3c4043",
-    accent="#8ab4f8",
-    accent_hover="#aecbfa",
-    accent_pressed="#d2e3fc",
-    accent_light="#28292c",
-    selection_bg="#394457",
+    accent="#58a6ff",
+    accent_hover="#79c0ff",
+    accent_pressed="#a5d6ff",
+    accent_light="#1f3a5f",
+    selection_bg="#1f3a5f",
     danger="#f28b82",
     warning="#fdd663",
     success="#81c995",
-    info="#8ab4f8",
+    info="#58a6ff",
     canvas_bg=QColor("#131314"),
     canvas_frame=QColor("#5f6368"),
     frame_line=QColor(255, 255, 255, 245),
@@ -178,10 +178,10 @@ DARK = Palette(
     subject_line=QColor(253, 214, 99, 235),
     subject_fill=QColor(253, 214, 99, 42),
     handle_fill=QColor(255, 255, 255),
-    handle_edge=QColor("#8ab4f8"),
+    handle_edge=QColor("#58a6ff"),
     pick_mark=QColor("#f28b82"),
     pick_mark_ring=QColor(255, 255, 255, 220),
-    pick_negative=QColor("#8ab4f8"),
+    pick_negative=QColor("#58a6ff"),
     pick_negative_ring=QColor(255, 255, 255, 220),
     grid_line=QColor(255, 255, 255, 50),
 )
@@ -382,6 +382,14 @@ def _repolish(app) -> None:
     QApplication 上，整体替换会把 Fluent 外观（尤其深色下的卡片底色）一并冲掉。
     """
     app.setPalette(qt_palette())
+    # P0-3：强调色也要跟着主题走 —— 浅/深两套 accent 不同，只在启动时
+    # setThemeColor 一次的话，主按钮会一直用开机时那份蓝。
+    try:
+        from qfluentwidgets import setThemeColor
+
+        setThemeColor(palette().accent)
+    except Exception:  # noqa: BLE001 - 库不可用时不影响重绘
+        pass
     for widget in app.topLevelWidgets():
         widget.setStyleSheet(build_stylesheet())
         style = widget.style()

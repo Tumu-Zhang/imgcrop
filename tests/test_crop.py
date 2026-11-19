@@ -55,14 +55,30 @@ class TestCropSpecValidation:
     def test_subject_mode_ok_with_box(self):
         CropSpec(mode=CropMode.SUBJECT, subject=Box(0, 0, 10, 10)).validate()
 
-    def test_quad_mode_requires_four_points(self):
+    def test_quad_requires_four_points(self):
         with pytest.raises(SpecError):
-            CropSpec(mode=CropMode.QUAD, quad=[(0, 0), (1, 1), (2, 2)]).validate()
-        CropSpec(mode=CropMode.QUAD, quad=[(0, 0), (10, 0), (10, 10), (0, 10)]).validate()
+            CropSpec(quad=[(0, 0), (1, 1), (2, 2)]).validate()
+        CropSpec(quad=[(0, 0), (10, 0), (10, 10), (0, 10)]).validate()
 
-    def test_quad_mode_rejects_degenerate(self):
+    def test_quad_rejects_degenerate(self):
         with pytest.raises(SpecError):
-            CropSpec(mode=CropMode.QUAD, quad=[(0, 0), (0, 0), (10, 10), (0, 10)]).validate()
+            CropSpec(quad=[(0, 0), (0, 0), (10, 10), (0, 10)]).validate()
+
+    def test_quad_enables_spec_alone(self):
+        """quad 是正交前置步骤：mode=NONE + quad 也是合法规格（只拉平不取景）。"""
+        spec = CropSpec(mode=CropMode.NONE, quad=[(0, 0), (10, 0), (10, 10), (0, 10)])
+        assert spec.enabled
+        spec.validate()
+
+    def test_quad_and_tilt_are_mutually_exclusive(self):
+        """掩膜在原图坐标系、拉平图坐标系对不上 —— 两个一起用只会算歪。"""
+        with pytest.raises(SpecError, match="同时"):
+            CropSpec(
+                mode=CropMode.SUBJECT,
+                subject=Box(0, 0, 10, 10),
+                quad=[(0, 0), (10, 0), (10, 10), (0, 10)],
+                rectify_tilt=True,
+            ).validate()
 
     def test_negative_margin_rejected(self):
         with pytest.raises(SpecError):
@@ -86,9 +102,8 @@ class TestDescribe:
         spec = CropSpec(mode=CropMode.SUBJECT, subject=Box(0, 0, 10, 10), margin=0.08)
         assert "86%" in spec.describe()
 
-    def test_quad_mode_mentions_output_size(self):
+    def test_quad_mentions_output_size(self):
         spec = CropSpec(
-            mode=CropMode.QUAD,
             quad=[(0, 0), (10, 0), (10, 10), (0, 10)],
             quad_size=(400, 300),
         )
@@ -196,24 +211,53 @@ class TestFreeCrop:
 
 
 class TestQuadCrop:
+    """透视拉平（D9 融合管线）：quad 是正交前置步骤，不是独立模式。"""
+
     def test_rectifies_to_requested_size(self):
         image = subject_image(Box(0, 0, 800, 600), size=(800, 600))
         quad = [(100, 100), (700, 140), (680, 540), (80, 500)]
         out = apply_crop(
             image,
-            CropSpec(mode=CropMode.QUAD, quad=quad, quad_size=(400, 400)),
+            CropSpec(mode=CropMode.NONE, quad=quad, quad_size=(400, 400)),
         )
         assert out.image.size == (400, 400)
         assert out.box is None
-        assert any("透视矫正" in warning for warning in out.warnings)
+        assert any("透视拉平" in warning for warning in out.warnings)
 
     def test_default_size_follows_edges(self):
         """输出尺寸按四边形边长推：宽 hypot(600,40)=601，高 hypot(20,400)=400。"""
         image = subject_image(Box(0, 0, 800, 600), size=(800, 600))
         quad = [(100, 100), (700, 140), (680, 540), (80, 500)]
-        out = apply_crop(image, CropSpec(mode=CropMode.QUAD, quad=quad))
+        out = apply_crop(image, CropSpec(mode=CropMode.NONE, quad=quad))
         assert out.image.size[0] == pytest.approx(601, abs=2)
         assert out.image.size[1] == pytest.approx(400, abs=2)
+
+    def test_quad_then_framing(self):
+        """融合管线：先拉平、再按主体取景 —— 框在拉平图坐标系里。"""
+        image = subject_image(Box(0, 0, 800, 600), size=(800, 600))
+        quad = [(0, 0), (800, 0), (800, 600), (0, 600)]  # 拉平后还是 800x600
+        subject = Box(300, 200, 700, 600)  # 拉平图坐标
+        out = apply_crop(
+            image,
+            CropSpec(mode=CropMode.SUBJECT, subject=subject, margin=0.0, quad=quad),
+        )
+        assert out.image.size == (400, 400)
+        assert out.box == subject
+
+    def test_quad_then_rotation(self):
+        """融合管线的顺序：拉平 -> 旋转 -> 取景。旋转作用在拉平结果上。"""
+        image = subject_image(Box(0, 0, 800, 600), size=(800, 600))
+        quad = [(0, 0), (800, 0), (800, 600), (0, 600)]
+        subject = Box(300, 280, 500, 320)
+        out = apply_crop(
+            image,
+            CropSpec(
+                mode=CropMode.SUBJECT, subject=subject, margin=0.0,
+                quad=quad, rotate_deg=12.0,
+            ),
+        )
+        assert any("透视拉平" in w for w in out.warnings)
+        assert any("手动角度旋转 +12.0°" in w for w in out.warnings)
 
 
 class TestTiltCorrection:

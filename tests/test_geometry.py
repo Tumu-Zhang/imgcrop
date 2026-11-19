@@ -448,3 +448,82 @@ class TestPadToFrame:
         out_image, _ = pad_to_frame(image, Box(-10, -10, 50, 50))
         assert out_image.mode == "L"
         assert out_image.getpixel((0, 0)) == 255
+
+
+class TestQuadFromMask:
+    """透视四角自动估计（UI-007）：掩膜边界 → 四个角点。"""
+
+    @staticmethod
+    def _tilted_rect_mask(size=(800, 600), angle=10.0, rect=(200, 150, 600, 450)):
+        """深底上一块旋转的白色矩形，返回 (布尔掩膜, 真值四角)。"""
+        import numpy as np
+        from PIL import Image, ImageDraw
+
+        layer = Image.new("L", size, 0)
+        ImageDraw.Draw(layer).rectangle(list(rect), fill=255)
+        layer = layer.rotate(angle, resample=Image.Resampling.BICUBIC, fillcolor=0)
+        mask = np.asarray(layer) > 127
+
+        # 真值四角：矩形四角绕中心旋转同角度
+        import math
+
+        cx, cy = size[0] / 2, size[1] / 2
+        rad = math.radians(angle)  # PIL rotate 正角 = 逆时针（屏幕坐标里 y 向下时为视觉逆时针）
+        cos, sin = math.cos(rad), math.sin(rad)
+        corners = []
+        for x, y in ((rect[0], rect[1]), (rect[2], rect[1]), (rect[2], rect[3]), (rect[0], rect[3])):
+            dx, dy = x - cx, y - cy
+            # PIL 的 rotate 在图像坐标系（y 向下）中：视觉逆时针 = 数学顺时针
+            corners.append((cx + dx * cos + dy * sin, cy - dx * sin + dy * cos))
+        return mask, corners
+
+    def test_clear_rectangle_recovers_corners(self):
+        """边界清晰的矩形物：四个角点应恢复到真值 ±3px（D-P 路径）。"""
+        from imgcrop.geometry import quad_from_mask
+
+        mask, truth = self._tilted_rect_mask()
+        quad = quad_from_mask(mask)
+        assert quad is not None and len(quad) == 4
+        for (qx, qy), (tx, ty) in zip(quad, truth):
+            assert qx == pytest.approx(tx, abs=3)
+            assert qy == pytest.approx(ty, abs=3)
+
+    def test_blob_degrades_to_min_area_rect(self):
+        """不规则形状：退化到最小面积包围矩形，仍给出规矩四角（不炸）。"""
+        import numpy as np
+        from imgcrop.geometry import quad_from_mask, order_quad
+
+        mask = np.zeros((400, 400), dtype=bool)
+        yy, xx = np.mgrid[0:400, 0:400]
+        mask[(xx - 200) ** 2 + (yy - 200) ** 2 < 120 ** 2] = True  # 圆形
+        quad = quad_from_mask(mask)
+        assert quad is not None and len(quad) == 4
+        ordered = order_quad(quad)
+        width = ordered[1][0] - ordered[0][0]
+        assert width > 200  # 包住直径 240 的圆
+
+    def test_empty_mask_returns_none(self):
+        import numpy as np
+        from imgcrop.geometry import quad_from_mask
+
+        assert quad_from_mask(np.zeros((100, 100), dtype=bool)) is None
+
+    def test_tiny_mask_returns_none(self):
+        import numpy as np
+        from imgcrop.geometry import quad_from_mask
+
+        mask = np.zeros((200, 200), dtype=bool)
+        mask[50:52, 50:52] = True  # 2x2 噪点
+        assert quad_from_mask(mask) is None
+
+    def test_result_is_well_ordered(self):
+        """返回值必须是直观顺序（左上/右上/右下/左下），quad_homography 直接可用。"""
+        from imgcrop.geometry import quad_from_mask, quad_output_size
+
+        mask, _truth = self._tilted_rect_mask()
+        quad = quad_from_mask(mask)
+        assert quad is not None
+        tl, tr, br, bl = quad
+        assert tl[0] < tr[0] and bl[0] < br[0]
+        assert tl[1] < bl[1] and tr[1] < br[1]
+        assert quad_output_size(quad) == quad_output_size(quad)  # 幂等可复算

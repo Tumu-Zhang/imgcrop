@@ -1,11 +1,17 @@
-"""裁剪编排：把一批照片按各自的裁剪方案裁好，再按统一规格输出。
+"""裁剪编排：把一批照片按各自的裁剪方案裁好，再按"所见即所得"输出。
 
-管线本身不关心"主体框从哪来"—— 自动分割、点选兜底、手动拖框、锁定复用
+管线本身不关心"主体框从哪来"—— 自动分割、点选、手动拖框、锁定复用
 都只是产出一个 Box，于是全自动与人工干预走的是同一条代码路径。这也意味着
-界面与命令行可以共享同一条输出链路：裁完直接按目标像素/DPI/格式出图。
+界面与命令行可以共享同一条输出链路。
 
-逐文件流式处理，不需要先把整批读进来：批内一致性由「主体归一化取景 +
-固定输出像素」共同保证（见 crop.py 的说明）。
+1.1.0 瘦身定案（D5/D6/D11）：输出不再做任何重采样 ——
+    成品像素 = 裁剪窗在当前旋转角下的原始像素，1:1 落盘；
+    格式跟随源文件（JPG→JPG、PNG→PNG 保透明、TIFF→PNG、其余→JPG），
+    DPI 元数据跟随源图（缺省 300）。
+"输出出现了 N 种尺寸"因此有了新含义：尺寸由每张图的取景框决定，
+批内不一致通常意味着取景框不一致 —— 这正是复核时想知道的事。
+
+逐文件流式处理，不需要先把整批读进来。
 """
 
 from __future__ import annotations
@@ -15,20 +21,13 @@ from collections.abc import Callable, Iterable
 from dataclasses import dataclass, field
 from pathlib import Path
 
-import numpy as np
 from PIL import Image
 
 from imgcrop import crop, encode, ingest, render
 from imgcrop.crop import CropSpec
-from imgcrop.encode import EncodeResult, VolumeLimitUnreachable
+from imgcrop.encode import EncodeResult
 from imgcrop.geometry import Box
-from imgcrop.model import (
-    ConflictPolicy,
-    OutputSpec,
-    SpecError,
-    TargetGeometry,
-    fit_within,
-)
+from imgcrop.model import ConflictPolicy, OutputSpec, SpecError
 
 ProgressCallback = Callable[["CropProgress"], None]
 CancelCheck = Callable[[], bool]
@@ -43,14 +42,14 @@ class CropPlan:
     """
 
     spec: CropSpec
-    mask: np.ndarray | None = None
+    mask: object | None = None
 
 
 CropProvider = Callable[[Path], "CropPlan | CropSpec | None"]
 
 
 def _no_crop(_source: Path) -> CropPlan | None:
-    """默认策略：不裁剪，只按输出规格重采样。"""
+    """默认策略：不裁剪，原图直接按源格式落盘。"""
     return None
 
 
@@ -78,11 +77,12 @@ class CropResult:
     source: Path
     out_path: Path | None
     ok: bool
-    geometry: TargetGeometry | None = None
+    out_size: tuple[int, int] | None = None
+    """成品像素尺寸 = 裁剪窗尺寸（1:1，无重采样）。"""
     num_bytes: int = 0
     encode: EncodeResult | None = None
     box: Box | None = None
-    """实际生效的裁剪窗（原图坐标系）；未裁剪时为 None。"""
+    """实际生效的裁剪窗（工作图坐标系）；未取景时为 None。"""
 
     warnings: list[str] = field(default_factory=list)
     error: str | None = None
@@ -93,8 +93,8 @@ class CropResult:
         if not self.ok:
             return f"失败：{self.error}"
         parts = []
-        if self.geometry:
-            parts.append(self.geometry.describe())
+        if self.out_size:
+            parts.append(f"{self.out_size[0]} x {self.out_size[1]} px")
         if self.encode:
             parts.append(self.encode.describe())
         return " / ".join(parts)
@@ -121,8 +121,8 @@ class CropReport:
         return self.fail_count == 0 and self.ok_count > 0
 
     def pixel_sizes(self) -> set[tuple[int, int]]:
-        """本批输出的像素尺寸集合。多于一种就说明批内还不完全一致。"""
-        return {r.geometry.pixel_size for r in self.results if r.ok and r.geometry}
+        """本批输出的像素尺寸集合。多于一种就说明批内取景还不完全一致。"""
+        return {r.out_size for r in self.results if r.ok and r.out_size}
 
 
 # ----------------------------------------------------------------------
@@ -137,13 +137,18 @@ def _resolve_output_dir(spec: OutputSpec, source: Path) -> Path:
     return Path(spec.output_dir) if spec.output_dir else default_output_dir(source.parent)
 
 
-def build_output_name(spec: OutputSpec, source: Path) -> str:
+def build_output_name(spec: OutputSpec, source: Path, extension: str) -> str:
+    """按命名模板与**输出格式**的扩展名拼出文件名。
+
+    扩展名由编码层按源格式解析（D6 跟随源），不进模板变量 —— 模板里的
+    {stem} 是唯一变量，写 {index} 这类未知占位符直接报 SpecError。
+    """
     template = spec.name_template or "{stem}"
     try:
         base = template.format(stem=source.stem)
     except (KeyError, IndexError, ValueError) as exc:
         raise SpecError(f"命名模板不合法：{template} —— {exc}") from exc
-    return f"{base}{spec.fmt.extension}"
+    return f"{base}{extension}"
 
 
 def resolve_conflict(path: Path, policy: ConflictPolicy) -> Path | None:
@@ -216,8 +221,8 @@ class Cropper:
             )
 
         try:
-            result = self._crop_image(source)
-        except (VolumeLimitUnreachable, SpecError) as exc:
+            result = self._crop_image(source, info)
+        except SpecError as exc:
             return CropResult(
                 source=source, out_path=None, ok=False, error=str(exc),
                 elapsed=time.perf_counter() - started,
@@ -233,7 +238,7 @@ class Cropper:
         return result
 
     # -- 单张实现 -------------------------------------------------------
-    def _crop_image(self, source: Path) -> CropResult:
+    def _crop_image(self, source: Path, info: ingest.SourceInfo) -> CropResult:
         loaded = render.load_raster(source)
         plan = _as_plan(self.crop_provider(source))
         image = loaded.image
@@ -246,17 +251,11 @@ class Cropper:
             box = outcome.box
             crop_warnings = list(outcome.warnings)
 
-        # 裁剪改变了图的尺寸，所以宽高比要按裁剪后的结果来解析 ——
-        # 这保证"裁完直接按投稿规格出图"是按裁剪结果的形状算的。
-        aspect = image.size[0] / image.size[1]
-        geometry = self.spec.resolve(aspect)
-        geometry, scale_warnings = fit_within(
-            geometry, image.size, allow_upscale=self.spec.allow_upscale
-        )
+        # 格式跟随源（D6）、DPI 跟随源（D11）—— 都是编码层的内部决策
+        fmt = encode.resolve_output_format(source.suffix)
+        dpi = encode.resolve_source_dpi(info.dpi)
 
-        image, resize_warnings = render.resize_raster(image, geometry.pixel_size)
-
-        out_path = self._plan_output(source)
+        out_path = self._plan_output(source, fmt)
         if out_path is None:
             return CropResult(
                 source=source, out_path=None, ok=False, box=box,
@@ -264,24 +263,18 @@ class Cropper:
                 warnings=loaded.warnings + crop_warnings,
             )
 
-        encoded = encode.encode_to_file(image, out_path, self.spec)
+        encoded = encode.encode_to_file(image, out_path, fmt, dpi=dpi)
         return CropResult(
             source=source, out_path=out_path, ok=True, box=box,
-            geometry=geometry, num_bytes=encoded.num_bytes, encode=encoded,
-            warnings=loaded.warnings + crop_warnings + scale_warnings
-            + resize_warnings + encoded.warnings,
+            out_size=image.size, num_bytes=encoded.num_bytes, encode=encoded,
+            warnings=loaded.warnings + crop_warnings + encoded.warnings,
         )
 
-    def _apply_crop(self, image: Image.Image, plan: CropPlan | None) -> tuple[Image.Image, Box | None, list[str]]:
-        if plan is None or not plan.spec.enabled:
-            return image, None, []
-        outcome = crop.apply_crop(image, plan.spec, plan.mask)
-        return outcome.image, outcome.box, list(outcome.warnings)
-
     # -- 内部工具 -------------------------------------------------------
-    def _plan_output(self, source: Path) -> Path | None:
+    def _plan_output(self, source: Path, fmt: str) -> Path | None:
         out_dir = _resolve_output_dir(self.spec, source)
-        name = build_output_name(self.spec, source)
+        extension = encode.extension_for_format(fmt)
+        name = build_output_name(self.spec, source, extension)
         return resolve_conflict(out_dir / name, self.spec.on_conflict)
 
     def _emit(self, index: int, total: int, current: str) -> None:

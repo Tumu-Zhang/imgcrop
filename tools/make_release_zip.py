@@ -14,7 +14,7 @@
 
 注意：当前 exe 采用「模型内置」策略（build.py 把两个 onnx 打进 _internal/models），
 所以 zip 会比较大（约 -30% 压缩后仍在百 MB 级）。「模型外置 + 首启指引
-fetch_models.py」是待定案项（见 组织部/PIPELINE.md 阶段规划），定案后本脚本
+fetch_models.py」是待定案项（见 ../组织部/PIPELINE.md 阶段规划），定案后本脚本
 需同步排除 _internal/models 并更新 README 分发说明。
 """
 

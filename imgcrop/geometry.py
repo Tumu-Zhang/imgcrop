@@ -41,15 +41,187 @@ from dataclasses import dataclass
 import numpy as np
 from PIL import Image
 
+def min_area_rect_corners(points: np.ndarray) -> tuple[Point, ...]:
+    """包围点集的最小面积矩形的四个角点（直观顺序 左上/右上/右下/左下）。
+
+    quad_from_mask 的退化路径：掩膜不是四边形（圆形、不规则）时，
+    凸包逼近给不出 4 顶点，就退回"最小面积包围矩形"——拉平结果至少
+    是一个规矩的矩形，不会歪。
+    """
+    angle = _min_area_rect_angle(points)
+    radians = math.radians(angle)
+    cos, sin = math.cos(radians), math.sin(radians)
+    along = points[:, 0] * cos + points[:, 1] * sin
+    across = -points[:, 0] * sin + points[:, 1] * cos
+    u0, u1 = float(along.min()), float(along.max())
+    v0, v1 = float(across.min()), float(across.max())
+    corners = [
+        (u * cos - v * sin, u * sin + v * cos)
+        for u, v in ((u0, v0), (u1, v0), (u1, v1), (u0, v1))
+    ]
+    return tuple(corners)
+
+
+def convex_hull(points: np.ndarray) -> np.ndarray:
+    """Andrew 单调链凸包（纯 Python，边界采样点规模下毫秒级）。
+
+    输入重复点会被去重；返回按逆时针顺序的顶点（首尾不重复）。
+    """
+    unique = sorted({(float(x), float(y)) for x, y in points})
+    if len(unique) <= 2:
+        return np.asarray(unique, dtype=np.float64)
+
+    def cross(o, a, b) -> float:
+        return (a[0] - o[0]) * (b[1] - o[1]) - (a[1] - o[1]) * (b[0] - o[0])
+
+    lower: list[tuple[float, float]] = []
+    for p in unique:
+        while len(lower) >= 2 and cross(lower[-2], lower[-1], p) <= 0:
+            lower.pop()
+        lower.append(p)
+    upper: list[tuple[float, float]] = []
+    for p in reversed(unique):
+        while len(upper) >= 2 and cross(upper[-2], upper[-1], p) <= 0:
+            upper.pop()
+        upper.append(p)
+    return np.asarray(lower[:-1] + upper[:-1], dtype=np.float64)
+
+
+def _dp_simplify(points: list[tuple[float, float]], eps: float) -> list[tuple[float, float]]:
+    """Douglas-Peucker 开放折线逼近：保留偏离弦超过 eps 的点。"""
+    if len(points) < 3:
+        return list(points)
+    keep = [False] * len(points)
+    keep[0] = keep[-1] = True
+    stack = [(0, len(points) - 1)]
+    while stack:
+        start, end = stack.pop()
+        if end <= start + 1:
+            continue
+        ax, ay = points[start]
+        bx, by = points[end]
+        dx, dy = bx - ax, by - ay
+        length = math.hypot(dx, dy)
+        best_dist, best_index = -1.0, start
+        for i in range(start + 1, end):
+            px, py = points[i]
+            if length < 1e-12:
+                dist = math.hypot(px - ax, py - ay)
+            else:
+                dist = abs(dy * (px - ax) - dx * (py - ay)) / length
+            if dist > best_dist:
+                best_dist, best_index = dist, i
+        if best_dist > eps:
+            keep[best_index] = True
+            stack.append((start, best_index))
+            stack.append((best_index, end))
+    return [p for p, k in zip(points, keep) if k]
+
+
+def _polygon_area(points: list[tuple[float, float]]) -> float:
+    """鞋带公式算多边形面积（顶点按顺序）。"""
+    total = 0.0
+    count = len(points)
+    for i in range(count):
+        x1, y1 = points[i]
+        x2, y2 = points[(i + 1) % count]
+        total += x1 * y2 - x2 * y1
+    return abs(total) / 2.0
+
+
+def approx_quad(points: np.ndarray) -> tuple[Point, ...] | None:
+    """凸包 → 恰好 4 顶点且贴合的四边形；给不出就返回 None。
+
+    做法：把凸包环从一条近似直径切成两段，各自做 D-P 逼近；eps 从粗到细
+    扫描，第一次得到"两段合计 4 个顶点（共享端点只算一次）"就检查贴合度
+    —— 四边形面积必须 ≥ 凸包面积的 92%。这条阈值挡住"圆形内接四边形"
+    这类切掉边缘的假四边形（圆的内接四边形只有凸包面积的六成多），
+    证件、纸张这类边界清晰的矩形物则轻松过关。
+    """
+    hull = convex_hull(points)
+    count = len(hull)
+    if count < 4:
+        return None
+    hull_list = [tuple(p) for p in hull]
+
+    # 近似直径端点：从顶点 0 出发最远的那个点。用它把闭合环切成两段。
+    offset = hull - hull[0]
+    far = int(np.argmax((offset * offset).sum(axis=1)))
+    if far == 0:
+        return None
+    first = hull_list[: far + 1]
+    second = hull_list[far:] + [hull_list[0]]
+
+    hull_area = _polygon_area(hull_list)
+    perimeter = sum(
+        math.hypot(b[0] - a[0], b[1] - a[1])
+        for a, b in zip(hull_list, hull_list[1:] + hull_list[:1])
+    )
+    eps = perimeter * 0.05
+    while eps >= perimeter * 0.002:
+        simplified = _dp_simplify(first, eps)[:-1] + _dp_simplify(second, eps)[:-1]
+        if len(simplified) == 4:
+            if hull_area <= 0 or _polygon_area(simplified) < hull_area * 0.92:
+                return None  # 四边形切掉了太多边缘：不是矩形物，交给包围矩形
+            try:
+                return tuple(order_quad(simplified))
+            except ValueError:
+                return None
+        if len(simplified) > 4:
+            # 顶点数随 eps 减小只会增多：已经跳过 4，再扫也不会回来
+            break
+        eps *= 0.7  # 顶点还不够（eps 太粗）：继续细化
+    return None
+
+
+def quad_from_mask(
+    mask: np.ndarray | Image.Image, threshold: float = 0.5
+) -> tuple[Point, ...] | None:
+    """从主体掩膜自动估计透视拉平的四角（原图坐标，直观顺序）。
+
+    透视矫正的"自动打底"（UI-007）：边界清晰的矩形物（证件、纸张、画框）
+    走凸包四边形逼近，角点准；形状不规则时退化到最小面积包围矩形，
+    保证总能给出一个规矩的四边形。掩膜里没有主体时返回 None。
+
+    掩膜必须已经在**原图空间**（segment.Proposal.source_mask() 等）。
+    """
+    hit = _as_bool_mask(mask, threshold)
+    if not hit.any():
+        return None
+    points = _boundary_samples(hit, max_points=4096)
+    if len(points) < 4:
+        return None
+
+    quad = approx_quad(points)
+    if quad is None:
+        quad = min_area_rect_corners(points)
+    quad = tuple(order_quad(quad))
+
+    # 面积保护：太小（退化/噪声）的四边形没有拉平价值
+    tl, tr, br, bl = quad
+    width = max(_dist(tl, tr), _dist(bl, br))
+    height = max(_dist(tl, bl), _dist(tr, br))
+    if width < 4 or height < 4:
+        return None
+    return quad
+
+
 __all__ = [
     "Box",
     "Frame",
     "Letterbox",
+    "approx_quad",
+    "convex_hull",
     "frame_for_subject",
+    "map_box_by_homography",
+    "map_point_by_homography",
     "mask_angle",
     "mask_to_box",
+    "min_area_rect_corners",
     "order_quad",
     "pad_to_frame",
+    "quad_from_mask",
+    "quad_homography",
     "quad_output_size",
     "rectify_quad",
     "rotate_box",
@@ -437,34 +609,143 @@ def rectify_quad(
     return image.transform(out_size, Image.Transform.QUAD, data, resample=resample)
 
 
+def quad_homography(quad: Sequence[Point], out_size: tuple[int, int]) -> np.ndarray:
+    """源图四边形 -> 输出矩形的**正向**单应（8 个系数，h33 = 1）。
+
+    PIL 的 QUAD 变换是"输出像素从源图采样"的反向映射；要把源图上的坐标
+    （主体框、提示点）映射到拉平后的图上（界面在拉平结果上继续取景），
+    需要正向单应。用四组对应点（源四角 -> 输出矩形四角）解 8 元线性方程组
+    （标准 find_coeffs，numpy 纯实现，无新依赖）。
+    """
+    tl, tr, br, bl = order_quad(quad)
+    width, height = out_size
+    source = [tl, tr, br, bl]
+    target = [(0.0, 0.0), (float(width), 0.0), (float(width), float(height)), (0.0, float(height))]
+
+    rows: list[list[float]] = []
+    rhs: list[float] = []
+    for (x, y), (u, v) in zip(source, target):
+        rows.append([x, y, 1.0, 0.0, 0.0, 0.0, -u * x, -u * y])
+        rhs.append(u)
+        rows.append([0.0, 0.0, 0.0, x, y, 1.0, -v * x, -v * y])
+        rhs.append(v)
+    matrix = np.asarray(rows, dtype=np.float64)
+    vector = np.asarray(rhs, dtype=np.float64)
+    coeffs, *_ = np.linalg.lstsq(matrix, vector, rcond=None)
+    return coeffs
+
+
+def map_point_by_homography(coeffs: np.ndarray, x: float, y: float) -> Point:
+    """用 quad_homography 的系数把源图坐标映射到拉平图坐标。"""
+    denominator = coeffs[6] * x + coeffs[7] * y + 1.0
+    if abs(denominator) < 1e-12:  # pragma: no cover - 拉平图上不会出现无穷远
+        raise ValueError("单应映射分母为零：四边形退化")
+    u = (coeffs[0] * x + coeffs[1] * y + coeffs[2]) / denominator
+    v = (coeffs[3] * x + coeffs[4] * y + coeffs[5]) / denominator
+    return float(u), float(v)
+
+
+def map_box_by_homography(coeffs: np.ndarray, box: Box) -> Box:
+    """源图矩形 -> 拉平图上的轴对齐包围盒。
+
+    与 rotate_box 同一条纪律：矩形的单应像不一定是矩形，轴对齐包围盒
+    **一定不小于**真实像，且不可逆 —— 要保留坐标的那一份，别拿映射过的
+    框反推。
+    """
+    corners = [
+        map_point_by_homography(coeffs, float(x), float(y))
+        for x, y in ((box.x1, box.y1), (box.x2, box.y1), (box.x1, box.y2), (box.x2, box.y2))
+    ]
+    xs = [round(u) for u, _ in corners]
+    ys = [round(v) for _, v in corners]
+    return Box(min(xs), min(ys), max(xs), max(ys))
+
+
 # ======================================================================
 # 倾斜
 # ======================================================================
 def mask_angle(mask: np.ndarray | Image.Image, threshold: float = 0.5) -> float:
-    """用 PCA 长轴估计主体的倾斜角（度），范围 (-45, 45]。
+    """用最小面积矩形拟合估计主体的倾斜角（度），范围 (-45, 45]。
 
-    正值表示长轴从水平方向逆时针偏转。长轴无方向，所以结果折到
-    半圈之内 —— 否则同一个物体旋转 180 度会给出两个"正确"答案。
+    1.1.0 升级（D10 定案）：旧实现用 PCA 长轴，对细长物体（笔、尺子）好用，
+    对块状物体（证件、书本）偏弱 —— PCA 的轴向在近方形上不稳定。这里改为
+    **最小面积矩形拟合**（numpy 纯实现，等价 cv2.minAreaRect）：
+    扫描旋转角，找包围掩膜面积最小的那个方向，证件/文档类估角明显更稳。
+
+    正值表示长轴从水平方向逆时针偏转。轴向无方向（矩形转 90° 面积不变），
+    所以结果折到半圈之内 —— 否则同一个物体旋转 180 度会给出两个"正确"答案。
+
+    实现：用每行/列的边界像素当支撑点（数量远小于全部前景点），对候选角度
+    网格做向量化投影，取投影包围盒面积最小者，再在最优角附近细化。
     """
     hit = _as_bool_mask(mask, threshold)
-    ys, xs = np.nonzero(hit)
-    if xs.size < 2:
+    points = _boundary_samples(hit)
+    if len(points) < 2:
         return 0.0
-    x = xs.astype(np.float64)
-    y = ys.astype(np.float64)
-    x -= x.mean()
-    y -= y.mean()
-    cov = np.array([[float((x * x).mean()), float((x * y).mean())],
-                    [float((x * y).mean()), float((y * y).mean())]])
-    _, eigvecs = np.linalg.eigh(cov)
-    vx, vy = eigvecs[:, -1]  # 最大特征值方向 = 长轴
-    angle = math.degrees(math.atan2(vy, vx))
-    angle = (angle + 90.0) % 180.0 - 90.0  # -> (-90, 90]
+    angle = _min_area_rect_angle(points)
     if angle > 45.0:
         angle -= 90.0
     elif angle <= -45.0:
         angle += 90.0
     return angle
+
+
+def _boundary_samples(hit: np.ndarray, max_points: int = 2048) -> np.ndarray:
+    """提取掩膜的边界采样点 (N, 2)，供最小面积矩形扫描。
+
+    最小面积矩形的支撑点一定落在凸包上，而每行/每列的最左最右、最上最下
+    像素必然在凸包上 —— 取这些点（隔行/隔列采样封顶）既不丢精度又够快。
+    """
+    if not hit.any():
+        return np.zeros((0, 2), dtype=np.float64)
+
+    points: list[tuple[float, float]] = []
+    row_indices = np.flatnonzero(hit.any(axis=1))
+    if row_indices.size:
+        step = max(1, row_indices.size // max(1, max_points // 2))
+        for y in row_indices[::step]:
+            cols = np.flatnonzero(hit[y])
+            points.append((float(cols[0]), float(y)))
+            points.append((float(cols[-1]), float(y)))
+
+    col_indices = np.flatnonzero(hit.any(axis=0))
+    if col_indices.size:
+        step = max(1, col_indices.size // max(1, max_points // 2))
+        for x in col_indices[::step]:
+            rows = np.flatnonzero(hit[:, x])
+            points.append((float(x), float(rows[0])))
+            points.append((float(x), float(rows[-1])))
+
+    return np.asarray(points, dtype=np.float64)
+
+
+def _min_area_rect_angle(points: np.ndarray) -> float:
+    """扫描旋转角，返回包围点集面积最小的方向角，范围 (-90, 90]。
+
+    对每个候选角 θ，把点投影到 (cosθ, sinθ) 与其法向，两个方向的跨度之积
+    就是该角度下包围矩形的面积。先 0.5° 粗扫，再在最优角 ±1° 内按 0.05°
+    细化 —— 精度足够倾斜校正用，计算量对 numpy 是毫秒级。
+    """
+    coarse = np.arange(-90.0, 90.0, 0.5)
+    best = _best_angle(points, coarse)
+    fine = np.arange(best - 1.0, best + 1.0, 0.05)
+    return float(_best_angle(points, fine))
+
+
+def _best_angle(points: np.ndarray, angles: np.ndarray) -> float:
+    """返回 angles 里包围盒面积最小的角度。"""
+    xs = points[:, 0]
+    ys = points[:, 1]
+    radians = np.deg2rad(angles)
+    cos = np.cos(radians)[:, None]  # (A, 1)
+    sin = np.sin(radians)[:, None]
+
+    along = xs[None, :] * cos + ys[None, :] * sin          # 沿 θ 方向的投影
+    across = -xs[None, :] * sin + ys[None, :] * cos        # 垂直方向的投影
+    areas = (along.max(axis=1) - along.min(axis=1)) * (
+        across.max(axis=1) - across.min(axis=1)
+    )
+    return float(angles[int(np.argmin(areas))])
 
 
 def tilt_is_meaningful(
@@ -475,7 +756,7 @@ def tilt_is_meaningful(
 ) -> bool:
     """判断这个倾斜是否值得自动纠正。
 
-    球形、方形这类没有明确朝向的主体，PCA 长轴本身就不稳定，
+    球形、方形这类没有明确朝向的主体，最小面积矩形本身就不稳定，
     强行旋转只会把它转歪。所以只在主体明显细长、且角度落在一个
     可信区间内时才认为"值得转"。
     """
@@ -490,13 +771,24 @@ def rotate_image(
     background: tuple[int, int, int] = (255, 255, 255),
 ) -> Image.Image:
     """旋转图像并自动扩展画布（Pillow 约定：正角度为逆时针）。"""
-    fill = background if image.mode == "RGB" else 255 if image.mode == "L" else background
+    fill = _frame_fill(image.mode, background)
     return image.rotate(
         angle_deg,
         resample=Image.Resampling.BICUBIC,
         expand=True,
         fillcolor=fill,
     )
+
+
+def _frame_fill(mode: str, background: tuple[int, int, int]):
+    """取景/旋转补边的填充色：透明图补透明白，灰度图补灰阶，其余补背景色。"""
+    if mode == "RGBA":
+        return (*background, 0)
+    if mode == "L":
+        return 255
+    if mode in ("I", "I;16", "F"):
+        return 0
+    return background
 
 
 def rotate_box(
@@ -560,7 +852,7 @@ def pad_to_frame(
     if pad_left == pad_top == pad_right == pad_bottom == 0:
         return image, box
 
-    fill = background if image.mode == "RGB" else 255 if image.mode == "L" else background
+    fill = _frame_fill(image.mode, background)
     canvas = Image.new(
         image.mode,
         (width + pad_left + pad_right, height + pad_top + pad_bottom),

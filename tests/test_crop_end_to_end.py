@@ -14,7 +14,7 @@ from PIL import Image, ImageDraw
 
 from imgcrop import ingest, models
 from imgcrop.crop import CropMode, CropSpec
-from imgcrop.model import OutputFormat, OutputSpec, SizeMode
+from imgcrop.model import OutputSpec
 from imgcrop.pipeline import Cropper
 from imgcrop.segment import IsnetSegmenter
 
@@ -45,8 +45,12 @@ def load_crop_cli():
 
 
 class TestAutoCropPipeline:
-    def test_batch_with_different_subject_sizes_comes_out_uniform(self, tmp_path):
-        """这是这个功能的中心承诺：主体大小差 2.3 倍的照片，成品完全一致。"""
+    def test_batch_with_different_subject_sizes_keeps_uniform_share(self, tmp_path):
+        """中心承诺（1.1.0 语义）：主体大小差 2.3 倍的照片，主体在成品里的占比一致。
+
+        1.1.0 起输出 = 裁剪窗原像素（1:1，无重采样），"批内一致"因此表现为
+        主体占比一致 + 成品尺寸与主体尺寸成正比，而不是像素完全相同。
+        """
         photos: list[Path] = []
         for index, scale in enumerate((0.6, 1.0, 1.4)):
             width, height = int(300 * scale), int(240 * scale)
@@ -59,10 +63,7 @@ class TestAutoCropPipeline:
             )
 
         out = tmp_path / "out"
-        spec = OutputSpec(
-            size_mode=SizeMode.PIXELS, px_width=1000, px_height=1000,
-            dpi=300, fmt=OutputFormat.PNG, output_dir=out,
-        )
+        spec = OutputSpec(output_dir=out)
 
         segmenter = IsnetSegmenter()
         plans: dict[Path, CropSpec] = {}
@@ -70,8 +71,6 @@ class TestAutoCropPipeline:
             with Image.open(photo) as image:
                 best = segmenter.saliency(image).best
             assert best is not None, f"{photo.name} 没有找到主体"
-            # 固定比例是"整批像素尺寸完全一致"的必要条件：只做主体归一化时，
-            # 各图检测框的宽高比会有微差，等比内接后高度就会差几个像素。
             plans[photo] = CropSpec(
                 mode=CropMode.SUBJECT, subject=best, margin=0.08, aspect=4 / 3
             )
@@ -79,29 +78,23 @@ class TestAutoCropPipeline:
         report = Cropper(spec, crop_provider=plans.get).run(photos)
 
         assert report.fail_count == 0, [r.error for r in report.results if not r.ok]
-        sizes = set()
+        shares = []
         for photo in photos:
             with Image.open(out / f"{photo.stem}.png") as produced:
-                sizes.add(produced.size)
-
-        widths = {width for width, _ in sizes}
-        heights = {height for _, height in sizes}
-        assert widths == {1000}, sizes
-        # 高度允许 1 像素的取整差：裁剪窗是整数像素矩形，其宽高比无法精确等于
-        # 4:3，等比内接后就会差 1 像素 —— 与 model.py 里记录的"整数像素的必然
-        # 结果"是同一回事，Photoshop 也一样。要像素级严格一致就用 keep_aspect=False。
-        assert max(heights) - min(heights) <= 1, f"整批高度不应相差超过 1 像素：{sizes}"
-        assert min(heights) >= 748, f"比例明显不对：{sizes}"
+                assert produced.size[1] == pytest.approx(
+                    produced.size[0] * 3 / 4, rel=0.02
+                ), f"比例应固定为 4:3：{photo.name} {produced.size}"
+                shares.append(
+                    plans[photo].subject.width * (1 + 2 * 0.08) / produced.size[0]
+                )
+        assert max(shares) - min(shares) <= 0.03, f"主体占比应一致：{shares}"
 
     def test_source_files_are_untouched(self, tmp_path):
         photo = make_photo(tmp_path / "src" / "one.png", (300, 220, 800, 620))
         before = photo.read_bytes()
 
         out = tmp_path / "out"
-        spec = OutputSpec(
-            size_mode=SizeMode.PIXELS, px_width=800, px_height=800,
-            dpi=300, fmt=OutputFormat.PNG, output_dir=out,
-        )
+        spec = OutputSpec(output_dir=out)
         with Image.open(photo) as image:
             best = IsnetSegmenter().saliency(image).best
         assert best is not None

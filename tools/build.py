@@ -124,9 +124,18 @@ def _mv_to_trash(target: Path, trash: Path) -> None:
     """
     if not target.exists():
         return
-    dst = trash / target.name
+    _move_into_trash(target, trash)
+
+
+def _move_into_trash(target: Path, trash: Path, rel: Path | None = None) -> None:
+    """把 target mv 进 trash（可保相对结构），同名校验 + 时间戳兜底。
+
+    上一次打包留在 trash 里的同名路径会让 shutil.move 直接抛
+    "Destination path already exists"（2026-10-16 实测）—— mv 前必须查。
+    """
+    dst = trash / rel if rel is not None else trash / target.name
     if dst.exists():  # 上一次的垃圾还在：换个带时间戳的名字，绝不覆盖
-        dst = trash / f"{target.name}.{int(time.time())}"
+        dst = dst.with_name(f"{dst.name}.{int(time.time())}")
     dst.parent.mkdir(parents=True, exist_ok=True)
     shutil.move(str(target), str(dst))
 
@@ -154,9 +163,7 @@ def _prune(internal: Path) -> tuple[int, list[str], list[str]]:
             rel = target.relative_to(internal)
             if target.is_dir():
                 size = _measure(target)[1]
-                dst = trash / rel
-                dst.parent.mkdir(parents=True, exist_ok=True)
-                shutil.move(str(target), str(dst))
+                _move_into_trash(target, trash, rel)
             else:
                 size = target.stat().st_size
                 target.unlink(missing_ok=True)

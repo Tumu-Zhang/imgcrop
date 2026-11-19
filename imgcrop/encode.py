@@ -1,83 +1,114 @@
 """编码层：把位图写成目标格式，并写出正确的 DPI 元数据。
 
-体积上限的处理原则：能无损达标就无损；无损实在达不到，才在用户允许的前提下
-退到有损，并且一定回传警告，绝不静默降质。
+1.1.0 瘦身定案（D6、D11，见《功能瘦身与补足讨论稿.md》）：
+- **格式跟随源**：JPG→JPG、PNG→PNG（保透明）、TIFF→PNG，其余→JPG。
+  质量是内部常量（95），不设 UI —— "输出工程"链路已整体移除。
+- **DPI 跟随源图元数据，缺省 300**。纯元数据，不影响像素。
 
-实现细节：JPEG 的 optimize=True 会让 libjpeg 走二次扫描，遇到没有真实文件描述符
-的内存流（BytesIO）会在稍大的图上直接失败（"Suspension not allowed here"）。
-所以体积测量统一走有 fileno 的临时文件，而不是 BytesIO。
+实现细节：
+- JPEG 的 optimize=True 会让 libjpeg 走二次扫描，遇到没有真实文件描述符
+  的内存流（BytesIO）会在稍大的图上直接失败（"Suspension not allowed here"）。
+  所以体积测量统一走有 fileno 的临时文件，而不是 BytesIO。
+- RGBA 编码成 JPEG 时先把透明区合成白底（直接 convert("RGB") 会变黑）。
 """
 
 from __future__ import annotations
 
 import tempfile
-from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import IO
 
 import numpy as np
 from PIL import Image
 
-from imgcrop.model import (
-    OutputFormat,
-    OutputSpec,
-    TiffCompression,
-    format_bytes,
-)
+from imgcrop.model import format_bytes
 
 Image.MAX_IMAGE_PIXELS = 600_000_000
 
-# 体积上限搜索的兜底质量，低于它就没必要继续试了
-MIN_JPEG_QUALITY = 5
+# 输出 JPEG 的固定质量（D6 定案：不设 UI，保持内部常量）
+JPEG_QUALITY = 95
 
-# 规格层的压缩名 -> Pillow 认识的 TIFF 压缩名。
-# Pillow 对无法识别的名字不会报错，而是直接落成未压缩（tag 259 = 1），必须显式映射。
-PILLOW_TIFF_COMPRESSION = {
-    TiffCompression.LZW.value: "tiff_lzw",
-    TiffCompression.DEFLATE.value: "tiff_adobe_deflate",
-    TiffCompression.NONE.value: "raw",
-    TiffCompression.JPEG.value: "jpeg",
-}
+# 源图没有 DPI 元数据时写入的缺省值（D11 定案）
+DEFAULT_DPI = 300
+
+# 视作"JPEG 家族"的源后缀 -> 输出仍是 JPEG
+_JPEG_SUFFIXES = {".jpg", ".jpeg", ".jpe", ".jfif"}
+
+
+def resolve_output_format(source_suffix: str) -> str:
+    """按 D6 定案从源文件后缀解析输出格式名："png" / "jpeg"。
+
+    JPG→JPG、PNG→PNG（保透明）、TIFF→PNG；其余→JPG。
+    返回 Pillow 的格式名（"PNG" / "JPEG"），同时决定输出扩展名与编码路径。
+    """
+    suffix = source_suffix.lower().strip()
+    if suffix == ".png" or suffix in (".tif", ".tiff"):
+        return "PNG"
+    return "JPEG"
+
+
+def extension_for_format(fmt: str) -> str:
+    """输出格式的文件扩展名。"""
+    return ".png" if fmt == "PNG" else ".jpg"
+
+
+def resolve_source_dpi(dpi: tuple[float, float] | None) -> int:
+    """D11：DPI 元数据跟随源图；缺省 300。"""
+    if dpi:
+        try:
+            x, y = float(dpi[0]), float(dpi[1])
+        except (TypeError, ValueError, IndexError):
+            return DEFAULT_DPI
+        if x > 0 and abs(x - y) < 0.01 * max(x, y):
+            return max(1, int(round(x)))
+        if x > 0:
+            return max(1, int(round(x)))
+    return DEFAULT_DPI
 
 
 @dataclass
 class EncodeResult:
     path: Path
     num_bytes: int
-    quality_used: int | None = None
-    compression_used: str | None = None
+    fmt: str = ""
     warnings: list[str] = field(default_factory=list)
 
     def describe(self) -> str:
-        parts = [format_bytes(self.num_bytes)]
-        if self.quality_used is not None:
-            parts.append(f"quality={self.quality_used}")
-        if self.compression_used:
-            parts.append(self.compression_used)
-        return " / ".join(parts)
-
-
-class VolumeLimitUnreachable(RuntimeError):
-    """即使压到最低档也无法满足体积上限。"""
+        head = format_bytes(self.num_bytes)
+        return f"{head} / {self.fmt}" if self.fmt else head
 
 
 # ----------------------------------------------------------------------
 # 模式适配
 # ----------------------------------------------------------------------
-def _prepare_for_format(image: Image.Image, fmt: OutputFormat) -> tuple[Image.Image, list[str]]:
+def _flatten_rgba(image: Image.Image) -> tuple[Image.Image, list[str]]:
+    """把带透明通道的图合成到白底（供 JPEG 等不支持 alpha 的格式）。"""
+    if image.mode in ("RGBA", "LA", "PA"):
+        background = Image.new("RGB", image.size, (255, 255, 255))
+        alpha = image.convert("RGBA")
+        background.paste(alpha, mask=alpha.split()[-1])
+        return background, ["透明通道已合成到白色背景以适配 JPEG"]
+    if image.mode == "P":
+        rgba = image.convert("RGBA")
+        background = Image.new("RGB", image.size, (255, 255, 255))
+        background.paste(rgba, mask=rgba.split()[-1])
+        return background, ["调色板图已合成到白色背景以适配 JPEG"]
+    return image, []
+
+
+def _prepare_for_format(image: Image.Image, fmt: str) -> tuple[Image.Image, list[str]]:
     """把位图调整成目标格式能承载的模式。"""
     warnings: list[str] = []
     mode = image.mode
 
-    if fmt is OutputFormat.JPEG:
+    if fmt == "JPEG":
         if mode in ("I;16", "I;16B", "I;16L", "I;16N"):
             # JPEG 不支持高位深，按 PS 的"16 位 -> 8 位"惯例取高字节
             arr = np.asarray(image)
             if arr.dtype != np.uint16:
                 arr = np.clip(arr, 0, 65535).astype(np.uint16)
             image = Image.fromarray((arr >> 8).astype(np.uint8), mode="L")
-            warnings.append("16 位灰度已按高字节降为 8 位以适配 JPEG（等同 PS 的 8 位/通道转换）")
+            warnings.append("16 位灰度已按高字节降为 8 位以适配 JPEG")
         elif mode == "I":
             arr = np.clip(np.asarray(image), 0, 65535).astype(np.uint16)
             image = Image.fromarray((arr >> 8).astype(np.uint8), mode="L")
@@ -86,54 +117,41 @@ def _prepare_for_format(image: Image.Image, fmt: OutputFormat) -> tuple[Image.Im
             arr = np.clip(np.asarray(image) * 255.0, 0, 255).astype(np.uint8)
             image = Image.fromarray(arr, mode="L")
             warnings.append("浮点图已降为 8 位灰度以适配 JPEG")
-        elif mode not in ("L", "RGB", "CMYK"):
-            image = image.convert("RGB")
-            warnings.append(f"色彩模式 {mode} 已转换为 RGB 以适配 JPEG")
-        return image, warnings
-
-    if fmt is OutputFormat.PDF:
-        if mode not in ("L", "RGB", "CMYK"):
-            if mode in ("I;16", "I;16B", "I;16L", "I;16N"):
-                arr = np.asarray(image)
-                image = Image.fromarray((arr >> 8).astype(np.uint8), mode="L")
-                warnings.append("16 位灰度已降为 8 位以适配 PDF")
-            else:
+        elif mode not in ("L", "RGB"):
+            image, flat_warnings = _flatten_rgba(image)
+            warnings.extend(flat_warnings)
+            if image.mode == "CMYK":
                 image = image.convert("RGB")
+                warnings.append("CMYK 已转换为 RGB 以适配 JPEG")
         return image, warnings
 
-    if fmt is OutputFormat.PNG:
-        if mode in ("I", "F"):
-            arr = np.asarray(image)
-            if mode == "F":
-                arr = np.clip(arr * 255.0, 0, 255)
-            image = Image.fromarray(arr.astype(np.uint8), mode="L")
-            warnings.append("高位深/浮点图已降为 8 位以适配 PNG")
-        elif mode == "CMYK":
-            image = image.convert("RGB")
-            warnings.append("CMYK 已转换为 RGB 以适配 PNG")
-        return image, warnings
-
-    # TIFF 是科研场景里最宽容的容器，保留原模式
+    # PNG：保留透明通道（D6：PNG→PNG 保透明），只处理它装不下的模式
+    if mode in ("I", "F"):
+        arr = np.asarray(image)
+        if mode == "F":
+            arr = np.clip(arr * 255.0, 0, 255)
+        image = Image.fromarray(arr.astype(np.uint8), mode="L")
+        warnings.append("高位深/浮点图已降为 8 位以适配 PNG")
+    elif mode == "CMYK":
+        image = image.convert("RGB")
+        warnings.append("CMYK 已转换为 RGB 以适配 PNG")
     return image, warnings
 
 
 # ----------------------------------------------------------------------
-# 单次编码 / 体积测量
+# 单次编码
 # ----------------------------------------------------------------------
 def _save_to(
     image: Image.Image,
-    target: str | Path | IO[bytes],
-    fmt: OutputFormat,
+    target: str | Path,
+    fmt: str,
     dpi: int,
-    *,
-    quality: int,
-    compression: str,
 ) -> None:
     dpi_tuple = (dpi, dpi)
 
-    if fmt is OutputFormat.JPEG:
-        _save_jpeg(image, target, quality=quality, dpi=dpi_tuple)
-    elif fmt is OutputFormat.PNG:
+    if fmt == "JPEG":
+        _save_jpeg(image, target, dpi=dpi_tuple)
+    elif fmt == "PNG":
         image.save(
             target,
             format="PNG",
@@ -141,21 +159,11 @@ def _save_to(
             compress_level=9,
             optimize=True,
         )
-    elif fmt is OutputFormat.TIFF:
-        params: dict = {
-            "dpi": dpi_tuple,
-            "compression": PILLOW_TIFF_COMPRESSION.get(compression, compression),
-        }
-        if compression == "jpeg":
-            params["quality"] = quality
-        image.save(target, format="TIFF", **params)
-    elif fmt is OutputFormat.PDF:
-        image.save(target, format="PDF", resolution=float(dpi), quality=quality)
-    else:  # pragma: no cover - OutputFormat 已穷举
+    else:  # pragma: no cover - resolve_output_format 已穷举
         raise ValueError(f"未知输出格式：{fmt}")
 
 
-def _reset_target(target: str | Path | IO[bytes]) -> None:
+def _reset_target(target: str | Path) -> None:
     """重写同一个 file object 前把它清空，避免上一次尝试的残留字节。"""
     if hasattr(target, "seek"):
         target.seek(0)
@@ -164,7 +172,7 @@ def _reset_target(target: str | Path | IO[bytes]) -> None:
 
 
 def _save_jpeg(
-    image: Image.Image, target: str | Path | IO[bytes], *, quality: int, dpi: tuple[int, int]
+    image: Image.Image, target: str | Path, *, dpi: tuple[int, int]
 ) -> None:
     """保存 JPEG，必要时放弃 Huffman 表优化。
 
@@ -177,7 +185,7 @@ def _save_jpeg(
     """
     common = dict(
         format="JPEG",
-        quality=quality,
+        quality=JPEG_QUALITY,
         dpi=dpi,
         subsampling=0,      # 4:4:4，保住细线条与彩色文字的边缘
         progressive=False,
@@ -189,174 +197,49 @@ def _save_jpeg(
         image.save(target, optimize=False, **common)
 
 
-def _measure(
-    image: Image.Image, fmt: OutputFormat, dpi: int, *, quality: int, compression: str
-) -> int:
-    """编码一次并返回字节数，不保留结果。"""
-    with tempfile.TemporaryFile() as tmp:
-        _save_to(image, tmp, fmt, dpi, quality=quality, compression=compression)
-        tmp.seek(0, 2)  # 定位到末尾：编码过程中可能有 seek，以文件真实长度为准
-        return tmp.tell()
-
-
-def _search_quality(
-    measure: Callable[[int], int], limit: int, start_quality: int
-) -> int | None:
-    """二分搜索满足体积上限的最高质量；返回 None 表示连最低质量都达不到。"""
-    if measure(MIN_JPEG_QUALITY) > limit:
-        return None
-
-    best = MIN_JPEG_QUALITY
-    lo, hi = MIN_JPEG_QUALITY, start_quality
-    while lo <= hi:
-        mid = (lo + hi) // 2
-        if measure(mid) <= limit:
-            best = mid
-            lo = mid + 1
-        else:
-            hi = mid - 1
-    return best
-
-
-def _decide_params(
-    prepared: Image.Image, spec: OutputSpec, warnings: list[str]
-) -> tuple[int, str]:
-    """决定最终的 (quality, compression)，并保证满足体积上限或给出警告。
-
-    没有设置体积上限时完全不做额外编码，直接返回用户设定的参数。
-    """
-    fmt = spec.fmt
-    limit = spec.max_bytes
-    quality = spec.jpeg_quality
-    compression = spec.tiff_compression.value
-
-    if limit is None:
-        return quality, compression
-
-    size = _measure(prepared, fmt, spec.dpi, quality=quality, compression=compression)
-    if size <= limit:
-        return quality, compression
-
-    if fmt is OutputFormat.TIFF:
-        # 先在两个无损档位之间尝试，都不行才考虑有损
-        for candidate in ("lzw", "deflate"):
-            if candidate == compression:
-                continue
-            if _measure(prepared, fmt, spec.dpi, quality=quality, compression=candidate) <= limit:
-                warnings.append(
-                    f"为满足体积上限，TIFF 压缩由 {compression} 改用 {candidate}（仍为无损）"
-                )
-                return quality, candidate
-
-        if not spec.lossy_fallback:
-            raise VolumeLimitUnreachable(
-                f"TIFF 无损压缩后为 {format_bytes(size)}，超过上限 {format_bytes(limit)}；"
-                "请降低 DPI 或输出尺寸（或允许有损压缩兜底）"
-            )
-
-        chosen = _search_quality(
-            lambda q: _measure(prepared, fmt, spec.dpi, quality=q, compression="jpeg"),
-            limit,
-            quality,
-        )
-        if chosen is None:
-            floor_size = _measure(
-                prepared, fmt, spec.dpi, quality=MIN_JPEG_QUALITY, compression="jpeg"
-            )
-            raise VolumeLimitUnreachable(
-                f"TIFF 即使使用有损 JPEG 压缩（质量 {MIN_JPEG_QUALITY}）仍为 "
-                f"{format_bytes(floor_size)}，超过上限 {format_bytes(limit)}；"
-                "请降低 DPI 或输出尺寸"
-            )
-        warnings.append(
-            f"为满足体积上限 {format_bytes(limit)}，TIFF 已改用有损 JPEG 压缩（quality={chosen}）。"
-            "如需完全无损，请降低 DPI、缩小尺寸，或提高体积上限。"
-        )
-        return chosen, "jpeg"
-
-    if fmt in (OutputFormat.JPEG, OutputFormat.PDF):
-        chosen = _search_quality(
-            lambda q: _measure(prepared, fmt, spec.dpi, quality=q, compression=compression),
-            limit,
-            quality,
-        )
-        if chosen is None:
-            floor_size = _measure(
-                prepared, fmt, spec.dpi, quality=MIN_JPEG_QUALITY, compression=compression
-            )
-            raise VolumeLimitUnreachable(
-                f"即使质量降到 {MIN_JPEG_QUALITY}，体积仍为 {format_bytes(floor_size)}，"
-                f"超过上限 {format_bytes(limit)}；请降低 DPI 或输出尺寸"
-            )
-        warnings.append(f"为满足体积上限 {format_bytes(limit)}，质量由 {quality} 调整为 {chosen}")
-        return chosen, compression
-
-    # PNG：无损格式，压不动就只能如实报告，不做静默降级
-    if not spec.lossy_fallback:
-        raise VolumeLimitUnreachable(
-            f"PNG 为无损格式，最小 {format_bytes(size)}，超过上限 {format_bytes(limit)}；"
-            "请降低 DPI、缩小尺寸，或改用 JPEG"
-        )
-    warnings.append(
-        f"PNG 为无损格式，无法压到体积上限 {format_bytes(limit)} 之下（当前 {format_bytes(size)}）。"
-        "建议降低 DPI/尺寸或改用 JPEG；已按无损输出。"
-    )
-    return quality, compression
-
-
-def _quality_for_report(fmt: OutputFormat, quality: int, compression: str) -> int | None:
-    if fmt in (OutputFormat.JPEG, OutputFormat.PDF):
-        return quality
-    if compression == "jpeg":
-        return quality
-    return None
-
-
 # ----------------------------------------------------------------------
 # 对外接口
 # ----------------------------------------------------------------------
-def encode_to_file(image: Image.Image, path: Path, spec: OutputSpec) -> EncodeResult:
-    """编码并落盘。"""
+def encode_to_file(image: Image.Image, path: Path, fmt: str, *, dpi: int = DEFAULT_DPI) -> EncodeResult:
+    """编码并落盘。fmt 是 "PNG" / "JPEG"（resolve_output_format 的返回值）。"""
     path = Path(path)
-    prepared, warnings = _prepare_for_format(image, spec.fmt)
-    quality, compression = _decide_params(prepared, spec, warnings)
+    prepared, warnings = _prepare_for_format(image, fmt)
 
     path.parent.mkdir(parents=True, exist_ok=True)
-    _save_to(prepared, path, spec.fmt, spec.dpi, quality=quality, compression=compression)
+    _save_to(prepared, path, fmt, dpi)
 
     return EncodeResult(
         path=path,
         num_bytes=path.stat().st_size,
-        quality_used=_quality_for_report(spec.fmt, quality, compression),
-        compression_used=compression if spec.fmt is OutputFormat.TIFF else None,
+        fmt=fmt,
         warnings=warnings,
     )
 
 
-def encode_image(image: Image.Image, spec: OutputSpec) -> tuple[bytes, EncodeResult]:
+def encode_image(image: Image.Image, fmt: str, *, dpi: int = DEFAULT_DPI) -> tuple[bytes, EncodeResult]:
     """编码到内存，返回 (字节, 结果元信息)。供需要二次处理的调用方使用。"""
-    prepared, warnings = _prepare_for_format(image, spec.fmt)
-    quality, compression = _decide_params(prepared, spec, warnings)
+    prepared, warnings = _prepare_for_format(image, fmt)
 
     with tempfile.TemporaryFile() as tmp:
-        _save_to(prepared, tmp, spec.fmt, spec.dpi, quality=quality, compression=compression)
+        _save_to(prepared, tmp, fmt, dpi)
         tmp.seek(0)
         data = tmp.read()
 
     return data, EncodeResult(
         path=Path(),
         num_bytes=len(data),
-        quality_used=_quality_for_report(spec.fmt, quality, compression),
-        compression_used=compression if spec.fmt is OutputFormat.TIFF else None,
+        fmt=fmt,
         warnings=warnings,
     )
 
 
 __all__ = [
+    "DEFAULT_DPI",
     "EncodeResult",
-    "MIN_JPEG_QUALITY",
-    "PILLOW_TIFF_COMPRESSION",
-    "VolumeLimitUnreachable",
+    "JPEG_QUALITY",
     "encode_image",
     "encode_to_file",
+    "extension_for_format",
+    "resolve_output_format",
+    "resolve_source_dpi",
 ]

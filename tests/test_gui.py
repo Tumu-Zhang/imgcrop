@@ -20,7 +20,6 @@ from PIL import Image, ImageDraw  # noqa: E402
 
 from imgcrop.crop import CropMode  # noqa: E402
 from imgcrop.geometry import Box, Letterbox  # noqa: E402
-from imgcrop.model import SizeMode, Unit  # noqa: E402
 from imgcrop.render import load_raster  # noqa: E402
 from imgcrop.segment import PointHit, Proposal  # noqa: E402
 
@@ -33,11 +32,22 @@ class FakeMessageBox:
     """替掉真弹框：测试不能被模态对话框卡住。
 
     qfluentwidgets 的 MessageBox 构造是 (title, content, parent)，用法比原来短。
+    yesButton / cancelButton 只提供属性（1.1.0 起结果面板会给它们改文案）。
     """
 
     def __init__(self, title: str = "", content: str = "", parent=None) -> None:
         self.title = title
         self.text = content
+
+        class _Btn:
+            clicked = None  # 结果面板会 connect 这个信号；替身里用不上
+
+            def setText(self, _text: str) -> None: ...
+
+            def hide(self) -> None: ...
+
+        self.yesButton = _Btn()
+        self.cancelButton = _Btn()
 
     def exec(self) -> int:
         return 0
@@ -643,93 +653,128 @@ class TestList:
         assert window._photos[0] is broken  # noqa: SLF001
 
 
-class TestSize:
-    """尺寸设置：锁定联动、单位换算、拉伸与精确尺寸。"""
+class TestCorrectionCard:
+    """矫正卡（1.1.0）：旋转 ±180°、透视拉平的状态机。"""
 
-    def test_lock_syncs_the_other_edge(self, window, tmp_path):
-        item = make_item(make_photo(tmp_path / "a.png"))
-        window._photos = [item]  # noqa: SLF001
+    def _open(self, window, tmp_path, size=(1000, 800)):
+        photo = make_item(make_photo(tmp_path / "a.png", size=size))
+        window._photos = [photo]  # noqa: SLF001
         window._reload_list(select=0)  # noqa: SLF001
+        return photo
 
-        window.switch_lock.setChecked(True)
-        window.spin_width.setValue(1600)
-        # 裁剪框是 4:3，所以高度应当自己跟到 1200
-        assert abs(window.spin_height.value() - 1200) <= 2
+    def test_rotation_slider_reaches_180(self, window):
+        """D8：旋转范围 ±180°。"""
+        window.slider_rotate.setValue(175.0)
+        assert window.slider_rotate.value() == pytest.approx(175.0)
+        window.slider_rotate.setValue(-175.0)
+        assert window.slider_rotate.value() == pytest.approx(-175.0)
 
-        window.spin_height.setValue(600)
-        assert abs(window.spin_width.value() - 800) <= 2
+    def test_quad_editing_enters_and_exits(self, window, tmp_path):
+        photo = self._open(window, tmp_path)
 
-    def test_unlocking_lets_both_edges_be_set(self, window, tmp_path):
-        item = make_item(make_photo(tmp_path / "a.png"))
-        window._photos = [item]  # noqa: SLF001
-        window._reload_list(select=0)  # noqa: SLF001
+        window._toggle_quad_editing()  # noqa: SLF001
+        assert window.canvas.quad_mode is True
+        assert window.canvas.quad_points is not None
+        assert len(window.canvas.quad_points) == 4
+        assert "拉平" in window.hint.text()
 
-        window.switch_lock.setChecked(False)
-        window.spin_width.setValue(1600)
-        window.spin_height.setValue(500)
+        window._toggle_quad_editing(force_off=True)  # noqa: SLF001
+        assert window.canvas.quad_mode is False
+        assert photo.quad is None  # 退出编辑不等于应用
 
-        assert window.spin_width.value() == 1600
-        assert window.spin_height.value() == 500
+    def test_quad_commit_rectifies_the_photo(self, window, tmp_path):
+        """松手提交四角：拉平图生成、后续取景在拉平图坐标系里。"""
+        photo = self._open(window, tmp_path)
+        window._toggle_quad_editing()  # noqa: SLF001
 
-        spec = window._output_spec()  # noqa: SLF001
-        assert spec.keep_aspect is False
-        assert (spec.px_width, spec.px_height) == (1600, 500)
-        # 解锁 = 精确拉伸：结果像素必须等于所填值，哪怕比例和源图不符
-        assert spec.resolve(4 / 3).pixel_size == (1600, 500)
+        # 把四个角拖成整幅画面（0,0)-(1000,800)：拉平后尺寸不变
+        window._on_quad_committed(  # noqa: SLF001
+            [(0.0, 0.0), (1000.0, 0.0), (1000.0, 800.0), (0.0, 800.0)]
+        )
 
-    def test_locked_two_edges_fit_inside_the_box(self, window, tmp_path):
-        item = make_item(make_photo(tmp_path / "a.png"))
-        window._photos = [item]  # noqa: SLF001
-        window._reload_list(select=0)  # noqa: SLF001
+        assert photo.quad is not None
+        assert photo.rectified_image is None  # 惰性：第一次取用时才拉平
+        assert photo.work_image is not None  # noqa: SLF001
+        assert photo.work_image.size == (1000, 800)  # noqa: SLF001
+        spec = window._spec_for(photo)  # noqa: SLF001
+        assert spec is not None and spec.quad is not None
 
-        window.switch_lock.setChecked(True)
-        window.spin_width.setValue(1600)
-        window.spin_height.setValue(1200)
-        spec = window._output_spec()  # noqa: SLF001
-        assert spec.keep_aspect is True
-        # 方图放进 4:3 的框里 -> 短边顶满，不拉伸
-        assert spec.resolve(1.0).pixel_size == (1200, 1200)
+    def test_quad_commit_resets_stale_boxes(self, window, tmp_path):
+        """四角提交后旧取景框作废（坐标系换了，留着只会错位）——成品=拉平区域。"""
+        photo = self._open(window, tmp_path)
+        assert photo.subject_src is not None
 
-    def test_unit_switch_converts_the_value(self, window):
-        window.combo_unit.setCurrentIndex(0)  # 像素
-        window.spin_dpi.setValue(300)
-        window.spin_width.setValue(1600)
+        # 四角取画布中偏小的一块：拉平图与原图尺寸不同
+        window._on_quad_committed(  # noqa: SLF001
+            [(100.0, 100.0), (900.0, 120.0), (880.0, 700.0), (120.0, 680.0)]
+        )
 
-        window.combo_unit.setCurrentIndex(2)  # 厘米
-        assert abs(window.spin_width.value() - 13.55) < 0.02
+        assert photo.subject_src is None  # 旧框属于旧坐标系，作废
+        assert photo.free_src is not None
+        rectified_size = photo.work_image.size  # noqa: SLF001
+        assert photo.free_src.x2 <= rectified_size[0] + 2
+        assert photo.free_src.y2 <= rectified_size[1] + 2
 
-        window.combo_unit.setCurrentIndex(0)  # 回到像素
-        assert abs(window.spin_width.value() - 1600) <= 1
+    def test_quad_undo_returns_to_the_original(self, window, tmp_path):
+        photo = self._open(window, tmp_path)
+        window._on_quad_committed(  # noqa: SLF001
+            [(0.0, 0.0), (1000.0, 0.0), (1000.0, 800.0), (0.0, 800.0)]
+        )
+        assert photo.quad is not None
 
-    def test_physical_unit_makes_a_physical_spec(self, window):
-        window.combo_unit.setCurrentIndex(3)  # 英寸
-        window.spin_dpi.setValue(300)
-        window.spin_width.setValue(6)
-        window.spin_height.setValue(4)
+        window._undo_quad()  # noqa: SLF001
 
-        spec = window._output_spec()  # noqa: SLF001
-        assert spec.size_mode is SizeMode.PHYSICAL
-        assert spec.phys_unit is Unit.INCH
-        assert spec.resolve(1.5).pixel_size == (1800, 1200)
+        assert photo.quad is None
+        assert photo.subject is None  # 坐标系换了，旧框作废
+        assert photo.work_image is photo.image  # noqa: SLF001
 
-    def test_size_hint_states_pixels_and_cm(self, window, tmp_path):
-        item = make_item(make_photo(tmp_path / "a.png"))
-        window._photos = [item]  # noqa: SLF001
-        window._reload_list(select=0)  # noqa: SLF001
+    def test_quad_reuses_existing_points_when_reediting(self, window, tmp_path):
+        photo = self._open(window, tmp_path)
+        window._on_quad_committed(  # noqa: SLF001
+            [(50.0, 50.0), (950.0, 50.0), (950.0, 750.0), (50.0, 750.0)]
+        )
+        window._toggle_quad_editing()  # noqa: SLF001
 
-        window.combo_unit.setCurrentIndex(0)
-        window.spin_width.setValue(1600)
-        window.spin_height.setValue(1200)
+        points = window.canvas.quad_points  # noqa: SLF001
+        assert points is not None
+        assert points[0] == (50.0, 50.0)  # 已存的四角回到画布上继续调
 
-        text = window.label_size.text()  # noqa: SLF001
-        assert "px" in text and "cm" in text
+    def test_busy_blocks_scan_and_export(self, window, tmp_path):
+        """P0-1：三个任务入口共用一把锁，busy 期间不能再起新任务。"""
+        photo = self._open(window, tmp_path)
+        window._set_busy(True)  # noqa: SLF001
 
-    def test_size_preset_fills_both_edges(self, window):
-        window.combo_unit.setCurrentIndex(0)
-        window.combo_size_preset.setCurrentIndex(1)  # 1600 x 1200
+        assert not window.btn_scan.isEnabled()  # 识别按钮置灰
+        window._start_scan([0])  # noqa: SLF001
+        assert window._scan_thread is None  # noqa: SLF001  被拦截，没有起线程
 
-        assert window.spin_width.value() == 1600
-        assert window.spin_height.value() == 1200
+        window._export_all()  # noqa: SLF001
+        assert window._export_thread is None  # noqa: SLF001
+
+        window._set_busy(False)  # noqa: SLF001
+        assert window.btn_scan.isEnabled()
+
+    def test_clear_all_needs_confirmation(self, window, monkeypatch, tmp_path):
+        """P0-4：清空清单必须过确认框；取消时不丢数据。"""
+        photo = self._open(window, tmp_path)
+
+        class _FakeBtn:
+            def setText(self, _text: str) -> None: ...
+
+            def hide(self) -> None: ...
+
+        class RefusingBox:
+            def __init__(self, *args, **kwargs) -> None:
+                self.yesButton = _FakeBtn()
+                self.cancelButton = _FakeBtn()
+
+            def exec(self) -> int:
+                return 0  # 用户点了"先不清"
+
+        monkeypatch.setattr(mw, "MessageBox", RefusingBox)
+        window._clear_all()  # noqa: SLF001
+        assert len(window._photos) == 1  # noqa: SLF001
+        assert photo.path.exists()
 
 
 class TestNaming:
@@ -927,49 +972,32 @@ class TestExport:
 
         out = tmp_path / "out"
         window.edit_out.setText(str(out))
-        window.switch_lock.setChecked(False)
-        window.spin_width.setValue(400)
-        window.spin_height.setValue(320)
 
         window._export_all()  # noqa: SLF001
         wait_for_export(window, qapp)
 
+        # 所见即所得：自由框就是成品范围（1:1，无重采样）
         with Image.open(out / "a_crop.png") as image:
             assert image.size == (400, 320)
 
-    def test_export_writes_cropped_files(self, window, qapp, tmp_path):
+    def test_export_writes_the_crop_window_one_to_one(self, window, qapp, tmp_path):
+        """1.1.0 核心语义：成品像素 = 裁剪窗原像素（主体归一化取景的结果）。"""
         item = make_item(make_photo(tmp_path / "a.png"))
         window._photos = [item]  # noqa: SLF001
         window._reload_list(select=0)  # noqa: SLF001
 
+        expected = window._display_box(item)  # noqa: SLF001
+        assert expected is not None
+
         out = tmp_path / "out"
         window.edit_out.setText(str(out))
-        window.spin_width.setValue(600)
-
         window._export_all()  # noqa: SLF001
         wait_for_export(window, qapp)
 
         produced = out / "a_crop.png"
         assert produced.is_file()
         with Image.open(produced) as image:
-            assert image.size[0] == 600
-
-    def test_export_honours_exact_size_when_unlocked(self, window, qapp, tmp_path):
-        item = make_item(make_photo(tmp_path / "a.png"))
-        window._photos = [item]  # noqa: SLF001
-        window._reload_list(select=0)  # noqa: SLF001
-
-        out = tmp_path / "out"
-        window.edit_out.setText(str(out))
-        window.switch_lock.setChecked(False)
-        window.spin_width.setValue(600)
-        window.spin_height.setValue(600)
-
-        window._export_all()  # noqa: SLF001
-        wait_for_export(window, qapp)
-
-        with Image.open(out / "a_crop.png") as image:
-            assert image.size == (600, 600)
+            assert image.size == (expected.width, expected.height)
 
     def test_export_skips_excluded_images(self, window, qapp, tmp_path):
         first = make_item(make_photo(tmp_path / "a.png"))
@@ -989,3 +1017,81 @@ class TestExport:
     def test_export_without_subject_warns(self, window):
         window._export_all()  # noqa: SLF001
         assert "没有可导出" in window.status.text()
+
+
+class TestAutoQuad:
+    """自动选角（UI-007）：掩膜 → 四角 → 拉平；成品范围自动就位。"""
+
+    def _open(self, window, tmp_path, size=(1000, 800)):
+        photo = make_item(make_photo(tmp_path / "a.png", size=size))
+        window._photos = [photo]  # noqa: SLF001
+        window._reload_list(select=0)  # noqa: SLF001
+        return photo
+
+    def test_auto_quad_applies_rectification(self, window, tmp_path):
+        """有掩膜：自动估计四角并直接拉平，不需要用户拖任何东西。"""
+        import math
+
+        photo = self._open(window, tmp_path)
+        # 假掩膜：中央一块旋转的矩形（ISNet 真掩膜的替身）
+        layer = Image.new("L", photo.image.size, 0)
+        ImageDraw.Draw(layer).rectangle([200, 150, 600, 450], fill=255)
+        layer = layer.rotate(8.0, resample=Image.Resampling.BILINEAR, fillcolor=0)
+        photo.mask = np.asarray(layer) > 127
+
+        window._auto_quad()  # noqa: SLF001
+
+        assert photo.quad is not None and len(photo.quad) == 4
+        assert photo.mask is None  # 拉平后掩膜作废（坐标系纪律）
+        assert photo.work_image is not None  # noqa: SLF001
+        # 成品范围自动就位：拉平区域就是成品
+        assert photo.free_src is not None
+        assert photo.free_src.x1 == 0 and photo.free_src.y1 == 0
+        # 拉平输出尺寸 = 四边形边长估计，成品框应与之重合
+        from imgcrop.geometry import quad_output_size
+
+        width, height = quad_output_size(list(photo.quad))
+        assert photo.free_src.x2 == width and photo.free_src.y2 == height
+
+    def test_auto_quad_requires_a_mask(self, window, tmp_path):
+        """没识别过（无掩膜）：给出可操作的指引而不是静默失败。"""
+        photo = self._open(window, tmp_path)
+        photo.mask = None
+
+        window._auto_quad()  # noqa: SLF001
+
+        assert photo.quad is None
+        assert "识别主体" in window.status.text()
+
+    def test_auto_quad_resets_framing_to_the_full_frame(self, window, tmp_path):
+        """已有取景的图：拉平后成品 = 整个拉平区域（旧取景框作废）。
+
+        这是 UI-007"同步"的语义：拉平即取景，用户不需要再拖一遍框；
+        想二次构图直接在拉平结果上把框拖小。
+        """
+        photo = self._open(window, tmp_path)
+        assert photo.subject_src is not None  # 识别框在场
+
+        window._apply_quad(  # noqa: SLF001
+            photo, ((0.0, 0.0), (1000.0, 0.0), (1000.0, 800.0), (0.0, 800.0))
+        )
+
+        assert photo.subject_src is None  # 旧坐标系里的框作废
+        assert photo.free_src == Box(0, 0, 1000, 800)  # 成品 = 拉平区域
+        assert photo.free is not None  # 画布上有可见的成品框
+
+    def test_full_frame_quad_still_rectifies_and_exports(self, window, qapp, tmp_path):
+        """端到端：自动选角（整幅四角）→ 直接导出，成品 = 拉平区域。"""
+        photo = self._open(window, tmp_path)
+        window.edit_out.setText(str(tmp_path / "out"))  # noqa: SLF001
+
+        window._apply_quad(  # noqa: SLF001
+            photo, ((100.0, 100.0), (900.0, 100.0), (900.0, 700.0), (100.0, 700.0))
+        )
+        window._export_all()  # noqa: SLF001
+        wait_for_export(window, qapp)
+
+        produced = tmp_path / "out" / "a_crop.png"
+        assert produced.is_file()
+        with Image.open(produced) as image:
+            assert image.size == (800, 600)  # 四边形边长 800x600，1:1 输出

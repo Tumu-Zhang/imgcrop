@@ -4,23 +4,23 @@
 
 用法::
 
-    python -m imgcrop 照片目录 --out cropped --aspect 4:3 --px 1600
-    python -m imgcrop a.jpg b.jpg --aspect 1:1 --margin 0.1 --px 1600
+    python -m imgcrop 照片目录 --out cropped --aspect 4:3
+    python -m imgcrop a.jpg b.jpg --aspect 1:1 --margin 0.1
     python -m imgcrop 照片目录 --dry-run          # 只看识别到什么，不写文件
 
-尺寸/格式/体积上限与图形界面共用同一套 OutputSpec，所以命令行裁出来的图
-与界面里导出的完全一致。
+1.1.0 瘦身定案：输出=裁剪窗原像素（1:1），格式跟随源、DPI 跟随源 ——
+尺寸/DPI/格式/体积参数已删（见《功能瘦身与补足讨论稿.md》D5-D7）。
+透视拉平四点坐标不适合在命令行传，仍仅 GUI 可用。
 """
 
 from __future__ import annotations
 
 import argparse
-import sys
 from pathlib import Path
 
 from imgcrop import ingest
 from imgcrop.crop import ASPECT_PRESETS, CropMode, CropSpec
-from imgcrop.model import OutputFormat, OutputSpec, SizeMode
+from imgcrop.model import OutputSpec
 from imgcrop.pipeline import CropPlan, Cropper
 from imgcrop.render import load_raster
 from imgcrop.segment import IsnetSegmenter, SegmentError
@@ -38,23 +38,10 @@ def parse_aspect(text: str) -> float | None:
 
 
 def build_output_spec(args) -> OutputSpec:
-    if args.px is not None:
-        size_mode, px_width, px_height = SizeMode.PIXELS, args.px, args.px_height
-    elif args.px_width is not None or args.px_height is not None:
-        size_mode, px_width, px_height = SizeMode.PIXELS, args.px_width, args.px_height
-    else:
-        raise SystemExit("请给出输出尺寸：--px 1600（长边）或 --px-width/--px-height")
-
+    """落盘三件套：目录、命名、同名策略（尺寸/格式已删，见模块说明）。"""
     return OutputSpec(
-        size_mode=size_mode,
-        px_width=px_width,
-        px_height=px_height,
-        dpi=args.dpi,
-        fmt=OutputFormat(args.format),
-        keep_aspect=not args.exact_size,
         output_dir=args.out,
         name_template=args.name,
-        max_bytes=int(args.limit * 1024 * 1024) if args.limit else None,
     )
 
 
@@ -69,19 +56,12 @@ def build_parser() -> argparse.ArgumentParser:
         default="none",
         help="目标比例：1:1 / 4:3 / 16:9 / none（跟随主体）",
     )
-    parser.add_argument("--px", type=int, help="输出长边像素（配合 --aspect 可让整批尺寸完全一致）")
-    parser.add_argument("--px-width", type=int, help="输出宽度（像素），与 --px 等价")
-    parser.add_argument("--px-height", type=int, help="输出高度（像素），可选")
-    parser.add_argument("--dpi", type=int, default=300, help="输出 DPI，默认 300")
-    parser.add_argument("--format", default="png", choices=[f.value for f in OutputFormat])
-    parser.add_argument("--limit", type=float, help="单张体积上限（MB）")
-    parser.add_argument("--exact-size", action="store_true", help="输出严格等于指定像素尺寸")
     parser.add_argument("--rectify-tilt", action="store_true", help="按主体长轴自动校正倾斜")
     parser.add_argument(
         "--rotate",
         type=float,
         default=0.0,
-        help="手动旋转角（度，正 = 逆时针）；与 --rectify-tilt 叠加",
+        help="手动旋转角（度，±180，正 = 逆时针）；与 --rectify-tilt 叠加",
     )
     parser.add_argument("--dry-run", action="store_true", help="只报告检测到什么，不写文件")
     return parser
@@ -164,8 +144,8 @@ def main(argv: list[str] | None = None) -> int:
         picked = "、".join(f"{w}x{h}" for w, h in sorted(sizes))
         print(
             f"注意：本次输出出现了 {len(sizes)} 种像素尺寸（{picked}）。"
-            "这是因为各图主体形状略有差异 —— 指定 --aspect（例如 --aspect 4:3）"
-            "可让整批尺寸完全一致。"
+            "输出等于各图的取景框 —— 指定 --aspect（例如 --aspect 4:3）"
+            "可让整批取景形状一致。"
         )
 
     return 0 if report.fail_count == 0 else 1

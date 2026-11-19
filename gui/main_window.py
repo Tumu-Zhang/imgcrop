@@ -6,6 +6,8 @@
 
 线程规矩：模型推理与批量导出都在 worker 的独立线程里跑，主线程只负责绘制与
 状态刷新；界面回调一律不碰磁盘、不建会话，否则拖一下滑杆就能感到卡顿。
+并发规矩（P0-1）：识别、点选、导出共用一把 `_busy` 锁 —— 任务入口统一先查，
+busy 期间「识别主体」置灰，谁都不能并发跑两份模型。
 
 取景的三种模式（见 VIEW_MODES）
 --------------------------------
@@ -14,6 +16,10 @@
 - **点选**：EfficientSAM 交互式分割；点选常常只命中主体的一部分，
   所以这个模式下也允许直接拖框补全（"处处可拖"）。
 
+矫正卡（1.1.0，D9 融合定案）：自动转正 + 手动旋转 ±180° + 透视四角拉平
+同在一张卡。透视拉平不是第四种取景模式，而是正交前置步骤：拖好四个角点
+松手即拉平，之后的旋转与取景都作用在拉平结果上。
+
 同一个动作在三个模式下含义不同（拖动裁剪框＝改主体范围还是改成品范围），
 所以落库一律等"松手"（canvas.boxCommitted），拖动中只做提示。
 
@@ -21,7 +27,7 @@
 - **清单功能区**（左栏）：清单一屏到底 + 最常用的两个动作（添加图片、识别主体）；
   其余清单操作（添加文件夹、可疑优先、包含排除、移除、清空）收进「⋮」与右键菜单。
 - **预览功能区**（中栏）：模式分段控件 + 三个动作 + 画布 + 随模式变化的提示。
-- **参数功能区**（右栏）：取景 / 尺寸与格式 / 导出 三张卡片。
+- **参数功能区**（右栏）：矫正 / 取景 / 导出 三张卡片。
 
 外观规矩（Google 风格）：
 - 控件一律用 qfluentwidgets 的版本（圆角、悬停、涟漪、跟随深浅色都由它负责）；
@@ -36,8 +42,15 @@ from pathlib import Path
 
 import numpy as np
 from PIL import Image
-from PySide6.QtCore import Qt, QThread, QUrl
-from PySide6.QtGui import QAction, QColor, QDesktopServices, QKeySequence, QShortcut
+from PySide6.QtCore import QSize, Qt, QThread, QUrl
+from PySide6.QtGui import (
+    QAction,
+    QColor,
+    QDesktopServices,
+    QIcon,
+    QKeySequence,
+    QShortcut,
+)
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QApplication,
@@ -61,7 +74,6 @@ from qfluentwidgets import (
     CaptionLabel,
     CheckBox,
     ComboBox,
-    DoubleSpinBox,
     FluentIcon as FIF,
     InfoBar,
     InfoBarPosition,
@@ -74,10 +86,8 @@ from qfluentwidgets import (
     PushButton,
     SegmentedWidget,
     SmoothScrollArea,
-    SpinBox,
     StrongBodyLabel,
     SubtitleLabel,
-    SwitchButton,
     TransparentToolButton,
 )
 
@@ -90,8 +100,16 @@ from imgcrop.crop import (
     planned_box,
     planned_rotation,
 )
-from imgcrop.geometry import Box, rotate_box, rotate_image
-from imgcrop.model import ConflictPolicy, OutputFormat, OutputSpec, SizeMode, Unit
+from imgcrop.geometry import (
+    Box,
+    map_box_by_homography,
+    quad_from_mask,
+    quad_homography,
+    quad_output_size,
+    rotate_box,
+    rotate_image,
+)
+from imgcrop.model import ConflictPolicy, OutputSpec
 from imgcrop.pipeline import CropPlan
 from imgcrop.segment import (
     EfficientSamSegmenter,
@@ -102,17 +120,11 @@ from imgcrop.segment import (
 
 from gui import theme
 from gui.canvas import CropCanvas
-from gui.widgets import AngleSlider, Card, NumberField, PercentSlider, text_width
+from gui.widgets import AngleSlider, Card, PercentSlider, text_width
 from gui.worker import ExportWorker, PickWorker, ScanWorker
 
 IMAGE_FILTER = (
     "图片 (" + " ".join(f"*{suffix}" for suffix in sorted(ingest.IMAGE_SUFFIXES)) + ");;所有文件 (*)"
-)
-
-FORMATS = (
-    ("PNG　无损", OutputFormat.PNG),
-    ("JPEG　小体积", OutputFormat.JPEG),
-    ("TIFF　无损投稿", OutputFormat.TIFF),
 )
 
 CONFLICTS = (
@@ -131,22 +143,8 @@ NAMING_MODES = (
 ROTATION_BACKGROUND = (255, 255, 255)
 """旋转/取景越界时补的背景色 —— 与 CropSpec 的默认值保持一致。"""
 
-# 尺寸单位：像素走 px 模式；其余走物理尺寸，配合 DPI 换算成像素。
-UNITS = (
-    ("像素　px", (SizeMode.PIXELS, None)),
-    ("毫米　mm", (SizeMode.PHYSICAL, Unit.MM)),
-    ("厘米　cm", (SizeMode.PHYSICAL, Unit.CM)),
-    ("英寸　in", (SizeMode.PHYSICAL, Unit.INCH)),
-)
-
-# 常用出图尺寸预设（宽, 高），单位跟随上面的选择
-SIZE_PRESETS = (
-    ("1600 × 1200", 1600, 1200),
-    ("2048 × 1536", 2048, 1536),
-    ("2560 × 1920", 2560, 1920),
-    ("1080 × 1080", 1080, 1080),
-    ("1920 × 1080", 1920, 1080),
-)
+# 输出语义（1.1.0 瘦身定案）：成品像素 = 裁剪窗原像素（1:1），格式跟随源、
+# DPI 跟随源 —— 右栏不再有尺寸/格式卡（D5-D7）。
 
 # 焦点在这些控件里时，单字母/数字快捷键必须让位给打字
 TEXT_INPUTS = (QLineEdit, QSpinBox, QDoubleSpinBox, QComboBox)
@@ -154,7 +152,8 @@ TEXT_INPUTS = (QLineEdit, QSpinBox, QDoubleSpinBox, QComboBox)
 # 取景模式（互斥三选一）。拖动裁剪框在不同模式下含义不同：
 #   智能取景 —— 框是"主体范围"，裁剪窗由留白与比例算出来；
 #   自由裁剪 —— 框就是最终裁剪窗，所见即所得；
-#   点选     —— 点一下分割出主体，拖动仍然可以自己框（点选常只选到一部分）。
+#   点选     —— EfficientSAM 交互式分割；点选常常只命中主体的一部分，
+#   所以这个模式下也允许直接拖框补全（"处处可拖"）。
 MODE_SMART = "smart"
 MODE_FREE = "free"
 MODE_PICK = "pick"
@@ -178,12 +177,38 @@ MODE_HINTS = {
 }
 """画布下方那句随模式变化的说明。"""
 
+QUAD_EDIT_HINT = "拖四个角点围住要拉平的区域，松手即应用；不满意就继续拖，或点「撤销拉平」回原图。"
+"""四角拉平编辑态下，画布下方的那句话。"""
+
+SHORTCUT_HELP = """\
+快捷键速查
+　←　→　　　切换识别候选
+　↑　↓　　　上一张 / 下一张图片
+　1 – 4　　　直接跳到第 N 个候选
+　R　　　　　回到自动识别结果
+　L　　　　　把当前框（含旋转角）套用到全部
+　T　　　　　智能取景（再按 P/F 切换其它模式）
+　P　　　　　点选分割
+　F　　　　　自由裁剪
+　Esc　　　　清除点选提示点
+　F5　　　　　识别主体
+　Ctrl+O　　　添加图片
+　Ctrl+Shift+O　添加文件夹
+　Ctrl+E　　　导出全部
+　Ctrl+Shift+E　导出当前选中
+　Space　　　包含 / 排除选中
+　Delete　　　从清单移除"""
+"""「帮助 → 键盘快捷键」里列出的完整速查表（P1-2：画布下方不再常驻）。"""
+
 BACKGROUND_PICK_SHARE = 0.85
 """点选命中范围超过画面的这个比例时，视为"点到背景"而不是"选中了物体"。
 
 SAM 类模型点在背景上会把整幅画面当成一块前景。真要点整幅画面的人极少，
 而误点背景很常见 —— 所以这里当成"没点中"，不覆盖用户原本可用的框。
 """
+
+THUMB_SIZE = 48
+"""清单缩略图的边长（像素，P1-1）。"""
 
 
 # 状态行颜色：语义 -> theme.Palette 上的字段名
@@ -206,10 +231,10 @@ def _fill_combo(combo, entries) -> None:
 
     坑 1：qfluentwidgets 的 `addItem` 第二个位置参数是**图标**，不是 userData ——
     照 Qt 的写法 `addItem(text, data)` 会把数据丢给 setIcon，`currentData()`
-    永远返回 None（单位、比例、格式、候选都会读空）。所以这里两段式地填。
+    永远返回 None（比例、命名、候选都会读空）。所以这里两段式地填。
 
-    坑 2：下拉框默认按"最短的那一项"给宽度，选中长选项（"2048 × 1536"、
-    "重命名（自动加序号）"）时文字会被裁掉。这里按**最长的一项**定最小宽度。
+    坑 2：下拉框默认按"最短的那一项"给宽度，选中长选项（"重命名（自动加序号）"）
+    时文字会被裁掉。这里按**最长的一项**定最小宽度。
     """
     for label, data in entries:
         combo.addItem(label)
@@ -239,6 +264,18 @@ def _tool_button(icon_name: str, tooltip: str, *, primary: bool = False):
     return button
 
 
+def _make_thumbnail(image: Image.Image, size: int = THUMB_SIZE) -> QIcon | None:
+    """把 PIL 图缩成清单缩略图（P1-1）。失败返回 None（调用方跳过图标）。"""
+    try:
+        thumb = image.convert("RGBA") if image.mode not in ("RGB", "RGBA") else image.copy()
+        thumb.thumbnail((size, size), Image.Resampling.LANCZOS)
+        from PIL.ImageQt import ImageQt
+
+        return QIcon(QPixmap.fromImage(ImageQt(thumb)))
+    except Exception:  # noqa: BLE001 - 缩略图是锦上添花，坏了不能影响识别
+        return None
+
+
 @dataclass(eq=False)
 class Photo:
     """清单里的一张图及其当前状态。"""
@@ -259,23 +296,26 @@ class Photo:
     """自由裁剪窗。设了就"所见即所得"，不再套用留白与比例（见 _display_box）。"""
 
     pick_box: Box | None = None
-    """最近一次点选命中的物体范围（**原图坐标**）。只用来告诉用户"点到了什么"。"""
+    """最近一次点选命中的物体范围（**工作图坐标**）。只用来告诉用户"点到了什么"。"""
 
     pick_score: float | None = None
     """最近一次点选的模型自评 IoU（0..1），随 pick_box 一起清空。"""
 
     rotate_deg: float = 0.0
-    """手动旋转角（度，正 = 逆时针）。每张图各自一份，"套用到全部"会把它带过去。"""
+    """手动旋转角（度，正 = 逆时针，±180°）。每张图各自一份，"套用到全部"会带过去。"""
 
     subject_src: Box | None = None
-    """主体框的**原图坐标**（识别/点选/拖框的原始结果，与旋转角无关）。
+    """主体框的**工作图坐标**（识别/点选/拖框的原始结果，与旋转角无关）。
 
     这是唯一的真相：`subject` 是由它按当前角度算出来的显示值。换角度时从
     这里重新算 —— 拿转过的框反推会一次比一次大（轴对齐包围盒不可逆）。
+
+    坐标系纪律：quad 为 None 时工作图 = 原图；quad 给定时工作图 = 拉平图
+    （识别框会经 quad_homography 映射过来，见 _apply_quad）。
     """
 
     free_src: Box | None = None
-    """自由裁剪框的原图坐标。与 subject_src 同理。"""
+    """自由裁剪框的工作图坐标。与 subject_src 同理。"""
 
     rotated_image: Image.Image | None = None
     """按当前角度旋转后的图（显示与取景都用它，缓存免得每帧重转）。"""
@@ -283,9 +323,23 @@ class Photo:
     rotated_angle: float = 0.0
     """rotated_image 是按多少角度转出来的 —— 角度变了就作废。"""
 
+    quad: tuple[tuple[float, float], ...] | None = None
+    """四点透视拉平（**原图坐标**，直观顺序 左上/右上/右下/左下）。None = 未拉平。"""
+
+    rectified_image: Image.Image | None = None
+    """按 quad 拉平后的图（工作图，缓存）。quad 变了就作废。"""
+
+    thumb: QIcon | None = None
+    """清单缩略图（P1-1）。识别载入时顺手生成。"""
+
     @property
     def name(self) -> str:
         return self.path.name
+
+    @property
+    def work_image(self) -> Image.Image | None:
+        """当前工作图：拉平了就是拉平图，否则是原图。旋转/取景都在它上面做。"""
+        return self.rectified_image if self.rectified_image is not None else self.image
 
     @property
     def candidates(self) -> list[Box]:
@@ -302,7 +356,10 @@ class Photo:
             return False
         if len(self.candidates) > 2:
             return True
-        width, height = self.image.size
+        work = self.work_image
+        if work is None:
+            return True
+        width, height = work.size
         share = (subject.width * subject.height) / max(1, width * height)
         return share < 0.03 or share > 0.7
 
@@ -313,6 +370,8 @@ class Photo:
             return "读取失败"
         if self.free is not None:
             return "自由裁剪"
+        if self.quad is not None:
+            return "已透视拉平" if self.subject is None else "拉平 + 取景"
         if self.subject is None:
             return "待识别"
         if self.manual:
@@ -336,9 +395,8 @@ class MainWindow(QMainWindow):
         self._mode: str = MODE_SMART
         """当前取景模式（智能取景 / 自由裁剪 / 点选），见 VIEW_MODES。"""
 
-        # 尺寸区：宽/高联动时用来防止信号互相触发，以及记住上一个单位做换算
-        self._syncing_size = False
-        self._last_unit: tuple[SizeMode, Unit | None] = (SizeMode.PIXELS, None)
+        self._quad_editing = False
+        """是否处于四角拉平编辑态（画布在拖四个角点）。"""
 
         self._isnet = IsnetSegmenter()
         self._sam = EfficientSamSegmenter()
@@ -349,13 +407,14 @@ class MainWindow(QMainWindow):
         self._export_thread: QThread | None = None
         self._export_worker: ExportWorker | None = None
         self._busy = False
+        self._cancel_requested = False
+        """用户点了「取消」：任务收尾时状态行按"已取消"汇报（P0-2）。"""
 
         # 样式表挂在**窗口**上，不要挂 QApplication —— 那会把 qfluentwidgets
         # 挂在 app 上的控件样式整个替换掉（深色下会变成白卡片配白字）。
         self.setStyleSheet(theme.build_stylesheet())
         self._build_ui()
         self._wire_shortcuts()
-        self._refresh_size_hint()
 
         missing = missing_models()
         if missing:
@@ -396,7 +455,7 @@ class MainWindow(QMainWindow):
         self.splitter.setSizes([260, 620, 400])
         outer.addWidget(self.splitter, 1)
 
-        # 底部状态行
+        # 底部状态行：进度 + 状态 + 取消（P0-2，仅任务运行时可见）
         bottom = QHBoxLayout()
         bottom.setSpacing(10)
         self.progress = ProgressBar()
@@ -405,6 +464,12 @@ class MainWindow(QMainWindow):
         self.progress.setTextVisible(False)
         self.progress.setFixedHeight(4)
         bottom.addWidget(self.progress, 1)
+
+        self.btn_cancel = PushButton("取消")
+        self.btn_cancel.setToolTip("停止当前批任务；已经处理完的图片结果保留")
+        self.btn_cancel.setVisible(False)
+        self.btn_cancel.clicked.connect(self._on_cancel_clicked)
+        bottom.addWidget(self.btn_cancel)
 
         self.status = CaptionLabel()
         self.status.setWordWrap(True)
@@ -451,6 +516,8 @@ class MainWindow(QMainWindow):
         self._add_action(view_menu, "应用当前框到全部", self._apply_current_box_to_all, "L")
 
         help_menu = menu.addMenu("帮助(&H)")
+        # P1-2：快捷键收进菜单，画布下方不再常驻整串键位
+        self._add_action(help_menu, "键盘快捷键", self._show_shortcuts, "F1")
         self._add_action(help_menu, "查看运行日志", self._open_run_log)
         self._add_action(help_menu, "关于 图片裁剪器", self._about)
 
@@ -478,13 +545,15 @@ class MainWindow(QMainWindow):
         head.addWidget(self.btn_more)
         layout.addLayout(head)
 
-        # 清单
+        # 清单（P1-1：带 48px 缩略图，行高随图标自然变高）
         self.list = ListWidget()
         self.list.setSelectionMode(QAbstractItemView.ExtendedSelection)
         self.list.setContextMenuPolicy(Qt.CustomContextMenu)
         self.list.customContextMenuRequested.connect(self._show_list_context_menu)
         self.list.currentRowChanged.connect(self._on_row_changed)
         self.list.itemChanged.connect(self._on_item_changed)
+        self.list.setIconSize(QSize(THUMB_SIZE, THUMB_SIZE))
+        self.list.setWordWrap(True)
         # 长文件名不适合用横向滚动条看 —— 关掉它，名字自然截断
         self.list.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
         layout.addWidget(self.list, 1)
@@ -533,6 +602,8 @@ class MainWindow(QMainWindow):
         self.canvas.pickRequested.connect(self._on_pick_clicked)
         self.canvas.resetRequested.connect(self._reset_current)
         self.canvas.cycleRequested.connect(self._on_canvas_cycle)
+        self.canvas.quadChanged.connect(self._on_quad_dragged)
+        self.canvas.quadCommitted.connect(self._on_quad_committed)
         layout.addWidget(self.canvas, 1)
 
         self.hint = CaptionLabel()
@@ -580,20 +651,20 @@ class MainWindow(QMainWindow):
         return bar
 
     def _update_canvas_hint(self) -> None:
-        """画布下方的说明：每个模式只讲这个模式下最该知道的那句话。"""
+        """画布下方的说明（P1-2）：只留当前模式的一句话，整串快捷键收进帮助菜单。"""
         if not hasattr(self, "hint"):
             return
-        self.hint.setText(
-            f"{MODE_HINTS.get(self._mode, '')}"
-            "　快捷键：← → 切候选，↑ ↓ 切换图片，R 重置，L 应用当前框到全部，"
-            "T 智能取景 / P 点选 / F 自由裁剪，Esc 清除提示点。"
-        )
+        if self._quad_editing:
+            self.hint.setText(QUAD_EDIT_HINT)
+        else:
+            self.hint.setText(MODE_HINTS.get(self._mode, ""))
 
     def _build_settings_panel(self) -> QWidget:
-        """右栏＝参数功能区：取景 / 尺寸与格式 / 导出 三张卡片，可整体滚动。
+        """右栏＝参数功能区：矫正 / 取景 / 导出 三张卡片，可整体滚动。
 
-        最小宽度是**量出来的**：标签列（"留白（每边）"）+ 字段列（最宽的控件，
-        例如"重命名（自动加序号）"下拉框）+ 卡片内边距与间距。窄于这个数，
+        1.1.0 起不再有「尺寸与格式」卡（D5：所见即所得，输出=裁剪窗原像素）。
+        最小宽度是**量出来的**：标签列 + 字段列（最宽的控件，例如
+        "重命名（自动加序号）"下拉框）+ 卡片内边距与间距。窄于这个数，
         库就会把某个输入框压扁，数字显示不全。
         """
         scroll = SmoothScrollArea()
@@ -607,8 +678,8 @@ class MainWindow(QMainWindow):
         layout.setContentsMargins(0, 0, 6, 0)
         layout.setSpacing(10)
 
-        layout.addWidget(self._build_crop_card())
-        layout.addWidget(self._build_size_card())
+        layout.addWidget(self._build_correct_card())
+        layout.addWidget(self._build_framing_card())
         layout.addWidget(self._build_export_card())
 
         self.label_params = CaptionLabel("—")
@@ -638,7 +709,57 @@ class MainWindow(QMainWindow):
         form.setHorizontalSpacing(12)
         return form
 
-    def _build_crop_card(self) -> Card:
+    # -- 矫正卡（D9 融合：自动转正 + 手动旋转 ±180° + 透视拉平） ---------
+    def _build_correct_card(self) -> Card:
+        card, layout = self._card()
+        layout.addWidget(StrongBodyLabel("矫正"))
+
+        form = self._form()
+
+        self.check_tilt = CheckBox("自动按主体转正（与手动角度叠加）")
+        self.check_tilt.toggled.connect(self._refresh_view)
+
+        self.slider_rotate = AngleSlider(0.0, minimum=-180.0, maximum=180.0)
+        self.slider_rotate.setToolTip(
+            "手动旋转画面（±180°，正=逆时针）。转完仍按水平矩形取景，"
+            "所以成品永远是正的；勾了上面的自动转正就是「自动打底 + 手动微调」。"
+        )
+        self.slider_rotate.valueChanged.connect(self._on_rotation_changed)
+
+        form.addRow(BodyLabel(""), self.check_tilt)
+        form.addRow(BodyLabel("旋转"), self.slider_rotate)
+        layout.addLayout(form)
+
+        # 透视拉平（D9）：自动选角打底 -> 需要时手动微调四角
+        quad_buttons = QHBoxLayout()
+        quad_buttons.setSpacing(8)
+        self.btn_quad_auto = _button("SEARCH", "自动选角")
+        self.btn_quad_auto.setToolTip(
+            "按主体边界自动估计四个角点并拉平（识别过即可用）；"
+            "边界清晰的证件、纸张、画框最准，不满意可再手动微调。"
+        )
+        self.btn_quad_auto.clicked.connect(self._auto_quad)
+        self.btn_quad = _button("TRANSFORM", "手动选角…")
+        self.btn_quad.setToolTip("自己拖四个角点围住要拉平的区域，松手即拉平")
+        self.btn_quad.clicked.connect(self._toggle_quad_editing)
+        self.btn_quad_undo = _tool_button("CLOSE", "撤销拉平：取消这张图的透视拉平，回到原图")
+        self.btn_quad_undo.clicked.connect(self._undo_quad)
+        quad_buttons.addWidget(self.btn_quad_auto, 1)
+        quad_buttons.addWidget(self.btn_quad, 1)
+        quad_buttons.addWidget(self.btn_quad_undo)
+        layout.addLayout(quad_buttons)
+
+        self.label_quad = CaptionLabel(
+            "先「识别主体」再「自动选角」最省事；斜拍的证件、画框、屏幕截图都适用。"
+            "拉平后的成品就是拉平区域本身，想二次构图再拖框。"
+        )
+        self.label_quad.setWordWrap(True)
+        self.label_quad.setFont(theme.ui_font(9, italic=True))
+        layout.addWidget(self.label_quad)
+        return card
+
+    # -- 取景卡 ----------------------------------------------------------
+    def _build_framing_card(self) -> Card:
         card, layout = self._card()
         layout.addWidget(StrongBodyLabel("取景"))
 
@@ -656,24 +777,12 @@ class MainWindow(QMainWindow):
         )
         self.slider_margin.valueChanged.connect(self._refresh_view)
 
-        self.check_tilt = CheckBox("自动按主体转正（与手动角度叠加）")
-        self.check_tilt.toggled.connect(self._refresh_view)
-
-        self.slider_rotate = AngleSlider(0.0)
-        self.slider_rotate.setToolTip(
-            "手动旋转画面（-45°~+45°，正=逆时针）。转完仍按水平矩形取景，"
-            "所以成品永远是正的；勾了上面的自动转正就是「自动打底 + 手动微调」。"
-        )
-        self.slider_rotate.valueChanged.connect(self._on_rotation_changed)
-
         self.combo_candidate = ComboBox()
         self.combo_candidate.currentIndexChanged.connect(self._on_candidate_changed)
 
         form.addRow(BodyLabel("比例"), self.combo_aspect)
         form.addRow(BodyLabel("留白（每边）"), self.slider_margin)
-        form.addRow(BodyLabel("旋转"), self.slider_rotate)
         form.addRow(BodyLabel("候选"), self.combo_candidate)
-        form.addRow(BodyLabel(""), self.check_tilt)
         layout.addLayout(form)
 
         margin_note = CaptionLabel(
@@ -685,78 +794,12 @@ class MainWindow(QMainWindow):
         layout.addWidget(margin_note)
         return card
 
-    def _build_size_card(self) -> Card:
-        """尺寸与格式 —— 单位、宽、高、「锁定原比例」（同 PowerPoint 改图片大小的逻辑）。"""
-        card, layout = self._card()
-        layout.addWidget(StrongBodyLabel("尺寸与格式"))
-
-        form = self._form()
-
-        self.combo_unit = ComboBox()
-        _fill_combo(self.combo_unit, UNITS)
-        self.combo_unit.currentIndexChanged.connect(self._on_unit_changed)
-
-        self.combo_size_preset = ComboBox()
-        _fill_combo(
-            self.combo_size_preset,
-            [("自定义", None)] + [(label, (w, h)) for label, w, h in SIZE_PRESETS],
-        )
-        self.combo_size_preset.currentIndexChanged.connect(self._on_size_preset_changed)
-
-        self.spin_width = NumberField(sample="000000")
-        self.spin_height = NumberField(sample="000000")
-        for field in (self.spin_width, self.spin_height):
-            field.setToolTip("留空＝按主体自动；填了就是这一边的输出尺寸")
-        self.spin_width.setValue(1600)
-        self.spin_height.setValue(1200)
-        self.spin_width.valueChanged.connect(self._on_width_changed)
-        self.spin_height.valueChanged.connect(self._on_height_changed)
-
-        # 单位单独标在行尾：输入框里只留数字，宽度需求就小得多（见 NumberField）
-        self.label_size_unit = CaptionLabel("px")
-        self.label_size_unit.setFont(theme.ui_font(10))
-
-        size_row = QWidget()
-        size_box = QHBoxLayout(size_row)
-        size_box.setContentsMargins(0, 0, 0, 0)
-        size_box.setSpacing(8)
-        size_box.addWidget(self.spin_width)
-        size_box.addWidget(BodyLabel("×"))
-        size_box.addWidget(self.spin_height)
-        size_box.addWidget(self.label_size_unit)
-        size_box.addStretch(1)
-
-        self.switch_lock = SwitchButton()
-        self.switch_lock.setOnText("锁定原比例")
-        self.switch_lock.setOffText("锁定原比例")
-        self.switch_lock.setChecked(True)
-        self.switch_lock.checkedChanged.connect(self._on_lock_toggled)
-
-        self.spin_dpi = SpinBox()
-        self.spin_dpi.setRange(36, 1200)
-        self.spin_dpi.setValue(300)
-        self.spin_dpi.setSuffix(" dpi")
-        self.spin_dpi.valueChanged.connect(self._refresh_size_hint)
-
-        self.combo_format = ComboBox()
-        _fill_combo(self.combo_format, FORMATS)
-
-        form.addRow(BodyLabel("单位"), self.combo_unit)
-        form.addRow(BodyLabel("宽 × 高"), size_row)
-        form.addRow(BodyLabel("预设"), self.combo_size_preset)
-        form.addRow(BodyLabel(""), self.switch_lock)
-        form.addRow(BodyLabel("分辨率"), self.spin_dpi)
-        form.addRow(BodyLabel("格式"), self.combo_format)
-        layout.addLayout(form)
-
-        self.label_size = CaptionLabel("—")
-        self.label_size.setWordWrap(True)
-        self.label_size.setFont(theme.ui_font(9))
-        layout.addWidget(self.label_size)
-        return card
-
     def _build_export_card(self) -> Card:
-        """导出（含落盘）：目录、命名、同名策略、体积上限与"真的写文件"按钮同一区。"""
+        """导出（含落盘）：目录、命名、同名策略与"真的写文件"按钮同一区。
+
+        1.1.0 起体积上限随"输出工程"链路一并删除（D7）；成品像素=裁剪窗
+        原像素、格式跟随源、DPI 跟随源 —— 都不再需要用户设置。
+        """
         card, layout = self._card()
         layout.addWidget(StrongBodyLabel("导出"))
 
@@ -783,18 +826,10 @@ class MainWindow(QMainWindow):
         self.combo_conflict = ComboBox()
         _fill_combo(self.combo_conflict, CONFLICTS)
 
-        self.spin_limit = DoubleSpinBox()
-        self.spin_limit.setRange(0.0, 200.0)
-        self.spin_limit.setDecimals(1)
-        self.spin_limit.setValue(0.0)
-        self.spin_limit.setSuffix(" MB")
-        self.spin_limit.setSpecialValueText("不限")
-
         form.addRow(BodyLabel("目录"), dir_row)
         form.addRow(BodyLabel("命名方式"), self.combo_name)
         form.addRow(BodyLabel("命名"), self.edit_name)
         form.addRow(BodyLabel("同名时"), self.combo_conflict)
-        form.addRow(BodyLabel("体积上限"), self.spin_limit)
         layout.addLayout(form)
 
         # 导出按钮区：主按钮突出，再加一个次要的「导出当前」
@@ -810,7 +845,10 @@ class MainWindow(QMainWindow):
         export_buttons.addWidget(self.btn_export_current, 1)
         layout.addLayout(export_buttons)
 
-        note = CaptionLabel("到这一步才真正写文件，之前都没动过原图。")
+        note = CaptionLabel(
+            "所见即所得：成品就是裁剪窗本身（不缩放不放大），格式跟随源图。"
+            "到这一步才真正写文件，之前都没动过原图。"
+        )
         note.setWordWrap(True)
         note.setFont(theme.ui_font(9, italic=True))
         layout.addWidget(note)
@@ -838,8 +876,17 @@ class MainWindow(QMainWindow):
         QShortcut(QKeySequence("F"), self).activated.connect(
             self._shortcut(lambda: self._toggle_mode(MODE_FREE))
         )
-        QShortcut(QKeySequence("Esc"), self).activated.connect(self._shortcut(self._clear_picks))
+        QShortcut(QKeySequence("Esc"), self).activated.connect(
+            self._shortcut(self._escape_pressed)
+        )
         QShortcut(QKeySequence("Ctrl+Shift+E"), self).activated.connect(self._export_current)
+
+    def _escape_pressed(self) -> None:
+        """Esc：四角编辑态优先退出；否则清点选提示点。"""
+        if self._quad_editing:
+            self._toggle_quad_editing(force_off=True)
+            return
+        self._clear_picks()
 
     def _toggle_mode(self, mode: str) -> None:
         """同一个键按两次回到智能取景 —— 点选／自由裁剪都是"临时用一下"的。"""
@@ -862,6 +909,13 @@ class MainWindow(QMainWindow):
     def _shortcut_candidate(self, order: int) -> None:
         if not self._typing():
             self._pick_candidate(order)
+
+    def _show_shortcuts(self) -> None:
+        """完整快捷键速查（P1-2 的入口）。"""
+        box = MessageBox("键盘快捷键", SHORTCUT_HELP, self)
+        box.yesButton.setText("知道了")
+        box.cancelButton.hide()
+        box.exec()
 
     def _show_list_context_menu(self, position) -> None:
         """清单右键菜单：单张常用操作。"""
@@ -892,162 +946,14 @@ class MainWindow(QMainWindow):
     def _about(self) -> None:
         MessageBox(
             "关于 图片裁剪器",
-            "自动找主体、按统一规格批量裁剪。\n\n"
+            "自动找主体，专注把照片裁正、裁好。\n\n"
             "· 识别：ISNet 通用显著性分割（可多候选切换）\n"
             "· 点选：EfficientSAM 交互式分割\n"
-            "· 取景与输出：本程序自己算，界面预览与导出结果一致\n\n"
+            "· 矫正：透视拉平 + 自动转正 + 手动旋转 ±180°\n"
+            "· 输出：所见即所得 —— 成品=裁剪窗原像素，格式跟随源图\n\n"
             "界面基于 PySide6 与 qfluentwidgets，配色按专业影像工具校准。",
             self,
         ).exec()
-
-    # ==================================================================
-    # 尺寸设置（单位 / 宽高联动 / 换算提示）
-    # ==================================================================
-    @staticmethod
-    def _unit_suffix(mode: SizeMode, unit: Unit | None) -> str:
-        if mode is SizeMode.PIXELS:
-            return " px"
-        return {"mm": " mm", "cm": " cm", "inch": " in"}.get(
-            unit.value if unit else "cm", " cm"
-        )
-
-    def _size_decimals(self) -> int:
-        mode, _unit = self.combo_unit.currentData()
-        return 0 if mode is SizeMode.PIXELS else 2
-
-    def _round_size(self, value: float) -> float:
-        return round(value, self._size_decimals())
-
-    def _crop_ratio(self) -> float | None:
-        """锁定比例的基准：优先用当前裁剪框的比例，其次用「比例」预设。"""
-        photo = self._photo()
-        if photo is not None:
-            box = self._display_box(photo)
-            if box is not None and box.height > 0:
-                return box.width / box.height
-        return self._aspect()
-
-    def _on_unit_changed(self, _index: int) -> None:
-        """换单位：数值跟着换算（像素 <-> 长度），并更新后缀与小数位。"""
-        mode, unit = self.combo_unit.currentData()
-        old_mode, old_unit = self._last_unit
-        width = self.spin_width.value()
-        height = self.spin_height.value()
-        dpi = float(self.spin_dpi.value())
-
-        self._syncing_size = True
-        suffix = self._unit_suffix(mode, unit)
-        decimals = self._size_decimals()
-        for field in (self.spin_width, self.spin_height):
-            field.setDecimals(decimals)
-        self.label_size_unit.setText(suffix.strip())
-
-        if (old_mode, old_unit) != (mode, unit):
-            self.spin_width.setValue(
-                self._convert_size(width, old_mode, old_unit, mode, unit, dpi)
-            )
-            self.spin_height.setValue(
-                self._convert_size(height, old_mode, old_unit, mode, unit, dpi)
-            )
-            self._last_unit = (mode, unit)
-        self._syncing_size = False
-
-        self._refresh_size_hint()
-
-    @staticmethod
-    def _to_inches(value: float, mode: SizeMode, unit: Unit | None, dpi: float) -> float:
-        if not value:
-            return 0.0
-        if mode is SizeMode.PIXELS:
-            return value / max(1.0, dpi)
-        return value / (unit or Unit.CM).per_inch
-
-    def _convert_size(
-        self,
-        value: float,
-        old_mode: SizeMode,
-        old_unit: Unit | None,
-        mode: SizeMode,
-        unit: Unit | None,
-        dpi: float,
-    ) -> float:
-        if not value:
-            return 0.0
-        inches = self._to_inches(value, old_mode, old_unit, dpi)
-        if mode is SizeMode.PIXELS:
-            return round(inches * dpi)
-        return round(inches * (unit or Unit.CM).per_inch, 2)
-
-    def _on_size_preset_changed(self, _index: int) -> None:
-        data = self.combo_size_preset.currentData()
-        if not data:
-            return
-        width, height = data
-        self._syncing_size = True
-        self.spin_width.setValue(self._round_size(float(width)))
-        self.spin_height.setValue(self._round_size(float(height)))
-        self._syncing_size = False
-        self._refresh_size_hint()
-
-    def _on_width_changed(self, value: float) -> None:
-        """改宽度：锁着比例时高度跟着变（PPT 里拖角点的感觉）。"""
-        if self._syncing_size:
-            return
-        if self.switch_lock.isChecked() and value > 0:
-            ratio = self._crop_ratio()
-            if ratio:
-                self._syncing_size = True
-                self.spin_height.setValue(self._round_size(value / ratio))
-                self._syncing_size = False
-        self._refresh_size_hint()
-
-    def _on_height_changed(self, value: float) -> None:
-        if self._syncing_size:
-            return
-        if self.switch_lock.isChecked() and value > 0:
-            ratio = self._crop_ratio()
-            if ratio:
-                self._syncing_size = True
-                self.spin_width.setValue(self._round_size(value * ratio))
-                self._syncing_size = False
-        self._refresh_size_hint()
-
-    def _on_lock_toggled(self, checked: bool) -> None:
-        if checked:
-            value = self.spin_width.value()
-            if value > 0:
-                ratio = self._crop_ratio()
-                if ratio:
-                    self._syncing_size = True
-                    self.spin_height.setValue(self._round_size(value / ratio))
-                    self._syncing_size = False
-        self._refresh_size_hint()
-
-    def _refresh_size_hint(self) -> None:
-        """把"这些设置到底会出多大的图"说清楚 —— 单位/比例两条线都在这里对上。"""
-        try:
-            spec = self._output_spec()
-            spec.validate()
-            geometry = spec.resolve(self._crop_ratio())
-        except Exception as exc:  # noqa: BLE001 - 提示行不该因为参数没填全就报错
-            self.label_size.setText(str(exc))
-            return
-
-        width, height = geometry.pixel_size
-        dpi = max(1, spec.dpi)
-        cm_w = width / dpi * 2.54
-        cm_h = height / dpi * 2.54
-        lines = [f"输出 {width} × {height} px ｜ {cm_w:.2f} × {cm_h:.2f} cm ｜ {dpi} dpi"]
-
-        if not spec.keep_aspect:
-            lines.append("比例已解锁：严格按所填宽高输出（不符时会拉伸）。")
-        else:
-            ratio = self._crop_ratio()
-            if ratio:
-                target = width / max(1, height)
-                if abs(ratio - target) > 0.01:
-                    lines.append("已按原比例等比内接（解锁可精确拉伸）。")
-        self.label_size.setText("\n".join(lines))
 
     # ==================================================================
     # 拖放与添加
@@ -1103,6 +1009,8 @@ class MainWindow(QMainWindow):
             item = QListWidgetItem(self._label_for(photo))
             item.setFlags(item.flags() | Qt.ItemIsUserCheckable)
             item.setCheckState(Qt.Checked if photo.included else Qt.Unchecked)
+            if photo.thumb is not None:
+                item.setIcon(photo.thumb)
             self.list.addItem(item)
         self.list.blockSignals(False)
         self.label_count.setText(f"{len(self._photos)} 张")
@@ -1130,6 +1038,8 @@ class MainWindow(QMainWindow):
             marks.append("✓")
         if photo.manual:
             marks.append("手")
+        if photo.quad is not None:
+            marks.append("拉")
         if not photo.included:
             marks.append("跳过")
         head = f"{' '.join(marks)}  {photo.name}"
@@ -1140,18 +1050,24 @@ class MainWindow(QMainWindow):
         if not (0 <= index < self.list.count()):
             return
         self.list.blockSignals(True)
-        self.list.item(index).setText(self._label_for(self._photos[index]))
+        item = self.list.item(index)
+        item.setText(self._label_for(self._photos[index]))
+        thumb = self._photos[index].thumb
+        if thumb is not None:
+            item.setIcon(thumb)
         self.list.blockSignals(False)
 
     def _on_row_changed(self, row: int) -> None:
         if row < 0 or row >= len(self._photos):
             return
         self._current = row
+        if self._quad_editing:
+            # 换图时退出四角编辑态：编辑的是"那一图"的四个角
+            self._toggle_quad_editing(force_off=True)
         self._sync_rotation_slider(self._photo())
         self._update_canvas()
         self._update_candidate_combo()
         self._update_param_labels()
-        self._refresh_size_hint()
 
     def _prev_photo(self) -> None:
         """上一张图。焦点在清单里时让清单自己处理，避免和全局快捷键重复。"""
@@ -1189,8 +1105,8 @@ class MainWindow(QMainWindow):
         if photo is not self._canvas_photo:
             self.canvas.clear_picks()
             self._canvas_photo = photo
-        # 喂给画布的是"旋转后的图"，框也随之在同一个坐标系里 —— 画布本身
-        # 不需要知道有旋转这回事
+        # 喂给画布的是"旋转后的工作图"，框也随之在同一个坐标系里 —— 画布本身
+        # 不需要知道有旋转/拉平这回事
         self.canvas.set_image(self._rotated_view(photo))
         # 智能取景下主体轮廓说明"识别到了什么"；点选出了结果之后同样要画出来 ——
         # 用户在点选模式下最需要的反馈就是"刚才那一下点中了什么"。
@@ -1219,32 +1135,34 @@ class MainWindow(QMainWindow):
         return normalize_angle(auto + manual)
 
     def _rotated_view(self, photo: Photo):
-        """按当前角度旋转后的图 —— 画布显示与取景都用它。
+        """按当前角度旋转后的工作图 —— 画布显示与取景都用它。
 
         角度不变时直接用缓存：拖动留白滑杆之类的高频刷新不该反复重转整图。
         """
         angle = self._rotation_angle(photo)
-        if photo.image is None or abs(angle) < 1e-6:
-            return photo.image
+        work = photo.work_image
+        if work is None or abs(angle) < 1e-6:
+            return work
         if photo.rotated_image is None or abs(photo.rotated_angle - angle) > 1e-6:
-            photo.rotated_image = rotate_image(photo.image, angle, ROTATION_BACKGROUND)
+            photo.rotated_image = rotate_image(work, angle, ROTATION_BACKGROUND)
             photo.rotated_angle = angle
         return photo.rotated_image
 
     def _to_view_box(self, photo: Photo, box: Box | None) -> Box | None:
-        """原图坐标 -> 当前旋转角坐标（给画布显示/摆框用）。"""
+        """工作图坐标 -> 当前旋转角坐标（给画布显示/摆框用）。"""
         if box is None or photo.image is None:
             return box
         angle = self._rotation_angle(photo)
         if abs(angle) < 1e-6:
             return box
         rotated = self._rotated_view(photo)
-        if rotated is None:
+        work = photo.work_image
+        if rotated is None or work is None:
             return box
-        return rotate_box(box, photo.image.size, rotated.size, angle)
+        return rotate_box(box, work.size, rotated.size, angle)
 
     def _to_source_box(self, photo: Photo, box: Box | None) -> Box | None:
-        """当前旋转角坐标 -> 原图坐标（用户拖完框之后存这个）。
+        """当前旋转角坐标 -> 工作图坐标（用户拖完框之后存这个）。
 
         逆变换只是"反着转同样的角度"，不是严格的数学逆 —— 轴对齐包围盒
         转过去再转回来会略大。所以只在"用户刚拖完"这一刻用它存 src，
@@ -1256,12 +1174,13 @@ class MainWindow(QMainWindow):
         if abs(angle) < 1e-6:
             return box
         rotated = self._rotated_view(photo)
-        if rotated is None:
+        work = photo.work_image
+        if rotated is None or work is None:
             return box
-        return rotate_box(box, rotated.size, photo.image.size, -angle)
+        return rotate_box(box, rotated.size, work.size, -angle)
 
     def _set_subject(self, photo: Photo, box_src: Box | None, *, view: Box | None = None) -> None:
-        """更新主体框：src 是原图坐标（真相），subject 是当前角度的显示值。"""
+        """更新主体框：src 是工作图坐标（真相），subject 是当前角度的显示值。"""
         photo.subject_src = box_src
         if box_src is None:
             photo.subject = None
@@ -1271,7 +1190,7 @@ class MainWindow(QMainWindow):
             photo.subject = self._to_view_box(photo, box_src)
 
     def _set_free(self, photo: Photo, box_src: Box | None, *, view: Box | None = None) -> None:
-        """更新自由裁剪框（同样：src 是原图坐标，free 是当前角度的显示值）。"""
+        """更新自由裁剪框（同样：src 是工作图坐标，free 是当前角度的显示值）。"""
         photo.free_src = box_src
         if box_src is None:
             photo.free = None
@@ -1304,7 +1223,6 @@ class MainWindow(QMainWindow):
         self._set_free(photo, photo.free_src)
         self._update_canvas()
         self._update_param_labels()
-        self._refresh_size_hint()
         if photo.image is not None:
             total = self._rotation_angle(photo)
             self._set_status(
@@ -1329,11 +1247,39 @@ class MainWindow(QMainWindow):
         )
 
     # ==================================================================
+    # 并发防护（P0-1）
+    # ==================================================================
+    def _set_busy(self, busy: bool) -> None:
+        """统一管理忙碌状态：busy 期间「识别主体」置灰，按钮与状态一起收口。"""
+        self._busy = busy
+        self.btn_scan.setEnabled(not busy)
+        self.btn_cancel.setVisible(busy)
+        if not busy:
+            self._cancel_requested = False
+
+    def _task_in_flight(self) -> bool:
+        return self._busy or self._scan_thread is not None or self._export_thread is not None
+
+    # ==================================================================
+    # 取消（P0-2）
+    # ==================================================================
+    def _on_cancel_clicked(self) -> None:
+        self._cancel_requested = True
+        if self._scan_worker is not None:
+            self._scan_worker.cancel()
+            self._set_status("正在取消识别（已完成的结果保留）…", kind="warning")
+        elif self._export_worker is not None:
+            self._export_worker.cancel()
+            self._set_status("正在取消导出（已完成的文件保留）…", kind="warning")
+        else:
+            self._cancel_requested = False
+
+    # ==================================================================
     # 识别
     # ==================================================================
     def _start_scan(self, indices: list[int]) -> None:
-        if self._scan_thread is not None:
-            self._set_status("上一批识别还没跑完，请稍候。", kind="warning")
+        if self._task_in_flight():
+            self._set_status("还有任务在跑（识别/点选/导出），等它结束再识别。", kind="warning")
             return
         targets = [index for index in indices if 0 <= index < len(self._photos)]
         if not targets:
@@ -1345,8 +1291,7 @@ class MainWindow(QMainWindow):
             )
             return
 
-        self._busy = True
-        self.btn_scan.setEnabled(False)
+        self._set_busy(True)
         self._set_status(f"正在识别主体（{len(targets)} 张）…（只识别，不写任何文件）")
 
         worker = ScanWorker(
@@ -1382,6 +1327,10 @@ class MainWindow(QMainWindow):
     def _on_scan_loaded(self, index: int, image) -> None:
         photo = self._photos[index]
         photo.image = image
+        if photo.thumb is None:
+            # P1-1：图反正已经读进来了，顺手产缩略图（读取失败的图没有缩略图）
+            photo.thumb = _make_thumbnail(image)
+            self._refresh_row(index)
         if index == self._current:
             self._update_canvas()
 
@@ -1396,6 +1345,12 @@ class MainWindow(QMainWindow):
             self._set_subject(photo, None)
         elif photo.manual:
             photo.status = f"候选 {len(proposal.boxes)} 个（保留手动框）"
+        elif photo.quad is not None:
+            # 已拉平：识别框在原图坐标，映射到拉平图坐标再入库
+            mapped = self._map_box_to_rectified(photo, best)
+            self._set_subject(photo, mapped)
+            photo.origin = "自动"
+            photo.status = f"候选 {len(proposal.boxes)} 个（已映射到拉平图）"
         else:
             self._set_subject(photo, best)
             photo.origin = "自动"
@@ -1405,7 +1360,6 @@ class MainWindow(QMainWindow):
             self._update_canvas()
             self._update_candidate_combo()
             self._update_param_labels()
-            self._refresh_size_hint()
 
     def _on_scan_failed(self, index: int, message: str) -> None:
         photo = self._photos[index]
@@ -1417,19 +1371,23 @@ class MainWindow(QMainWindow):
             self._update_param_labels()
 
     def _on_scan_finished(self) -> None:
-        self._busy = False
-        self.btn_scan.setEnabled(True)
-        self.progress.setRange(0, 100)
-        self.progress.setValue(100)
+        self._set_busy(False)
         done = sum(1 for photo in self._photos if self._display_box(photo) is not None)
         bad = sum(1 for photo in self._photos if photo.error)
         suspicious = sum(1 for p in self._photos if p.suspicious)
-        self._set_status(
-            f"识别完成：{done} 张有可取景范围，{bad} 张读取失败，{suspicious} 张建议复核。"
-            "核对好裁剪框后点右栏「导出全部」或「导出当前」。",
-            kind="ok" if not bad else "warning",
-        )
-        self._refresh_size_hint()
+        if self._cancel_requested:
+            self.progress.setValue(self.progress.value())
+            self._set_status(
+                f"已取消识别：本次完成到 {done} 张有可取景范围的结果（已保留）。", kind="warning"
+            )
+        else:
+            self.progress.setRange(0, 100)
+            self.progress.setValue(100)
+            self._set_status(
+                f"识别完成：{done} 张有可取景范围，{bad} 张读取失败，{suspicious} 张建议复核。"
+                "核对好裁剪框后点右栏「导出全部」或「导出当前」。",
+                kind="ok" if not bad else "warning",
+            )
 
     def _scan_listed(self) -> None:
         self._start_scan(list(range(len(self._photos))))
@@ -1450,7 +1408,6 @@ class MainWindow(QMainWindow):
         """
         self._update_canvas()
         self._update_param_labels()
-        self._refresh_size_hint()
 
     def _update_param_labels(self) -> None:
         photo = self._photo()
@@ -1482,11 +1439,16 @@ class MainWindow(QMainWindow):
         套用过来的都是。所以直接把这个框交给 apply_crop，别让它再转一遍：
         轴对齐框在旋转下不可精确往返，转两遍框会莫名变大，预览和导出就对
         不上了。命令行那边给的是原图坐标，走默认的 box_in_rotated_frame=False。
+
+        quad 给定时：框已经都在拉平图坐标系（识别结果映射过、新拖的直接
+        就在拉平图上），rectify_tilt 自动让位（掩膜坐标系对不上，D9 纪律）。
         """
+        rectify = self.check_tilt.isChecked() and photo.quad is None and photo.mask is not None
         if photo.free is not None:
             return CropSpec(
                 mode=CropMode.FREE,
                 subject=photo.free,
+                quad=photo.quad,
                 rotate_deg=photo.rotate_deg,
                 box_in_rotated_frame=True,
                 origin=photo.origin or "自由裁剪",
@@ -1496,9 +1458,10 @@ class MainWindow(QMainWindow):
         return CropSpec(
             mode=CropMode.SUBJECT,
             subject=photo.subject,
+            quad=photo.quad,
             margin=self._margin(),
             aspect=self._aspect(),
-            rectify_tilt=self.check_tilt.isChecked(),
+            rectify_tilt=rectify,
             rotate_deg=photo.rotate_deg,
             box_in_rotated_frame=True,
             origin=photo.origin or "自动",
@@ -1556,7 +1519,10 @@ class MainWindow(QMainWindow):
         candidates = photo.candidates
         if not (0 <= order < len(candidates)):
             return
-        self._set_subject(photo, candidates[order])
+        best = candidates[order]
+        if photo.quad is not None:
+            best = self._map_box_to_rectified(photo, best) or best
+        self._set_subject(photo, best)
         self._set_free(photo, None)
         photo.manual = False
         photo.origin = "候选"
@@ -1610,7 +1576,10 @@ class MainWindow(QMainWindow):
         photo.rotate_deg = 0.0
         photo.rotated_image = None
         self._sync_rotation_slider(photo)
-        self._set_subject(photo, photo.proposal.best)
+        best = photo.proposal.best
+        if best is not None and photo.quad is not None:
+            best = self._map_box_to_rectified(photo, best) or best
+        self._set_subject(photo, best)
         self._set_free(photo, None)
         photo.manual = False
         photo.origin = "自动"
@@ -1631,6 +1600,8 @@ class MainWindow(QMainWindow):
         """切换取景模式：工具条、画布光标、提示与预览一起跟上。"""
         if not hasattr(self, "canvas") or mode == self._mode:
             return
+        if self._quad_editing:
+            self._toggle_quad_editing(force_off=True)
         self._mode = mode
         self.mode_bar.blockSignals(True)
         self.mode_bar.setCurrentItem(mode)
@@ -1655,6 +1626,167 @@ class MainWindow(QMainWindow):
         """分段控件被点了 —— 它自己的状态已经更新，这里只做切换动作。"""
         if route_key and route_key != self._mode:
             self._set_mode(route_key)
+
+    # ==================================================================
+    # 透视拉平（D9）
+    # ==================================================================
+    def _auto_quad(self) -> None:
+        """自动选角（UI-007）：按主体掩膜的边界自动估计四个角点并拉平。
+
+        这是透视拉平的"自动打底"：掩膜来自已经跑过的识别/点选，零新增推理。
+        估计完直接应用拉平 —— 大多数情况一步到位；要微调点「手动选角…」，
+        已存的四个角点会回到画布上。
+        """
+        photo = self._photo()
+        if photo is None or photo.image is None:
+            self._set_status(
+                "先选中一张已读入的图片，再自动选角（识别会自动读图）。", kind="warning"
+            )
+            return
+        if self._task_in_flight():
+            self._set_status("还有任务在跑，等它结束再拉平。", kind="warning")
+            return
+        if photo.quad is not None:
+            self._set_status(
+                "这张图已经拉平过了；要重选就先「撤销拉平」，或点「手动选角…」微调。",
+                kind="info",
+            )
+            return
+        if photo.mask is None:
+            self._set_status(
+                "自动选角需要主体的掩膜：先「识别主体」（或在「点选」模式下点一下物体），"
+                "再回来点「自动选角」；也可以点「手动选角…」自己拖四个角点。",
+                kind="warning",
+            )
+            return
+
+        quad = quad_from_mask(photo.mask)
+        if quad is None:
+            self._set_status(
+                "没能从主体边界估计出四边形（主体太小或形状太不规则）——"
+                "请点「手动选角…」自己拖四个角点。",
+                kind="warning",
+            )
+            return
+
+        if self._quad_editing:
+            self._toggle_quad_editing(force_off=True)
+        self._apply_quad(photo, tuple(quad))
+        self._set_status(
+            "已按主体边界自动选角并拉平，成品就是拉平区域（可拖框二次构图）。"
+            "角点不准时点「手动选角…」微调，或「撤销拉平」回原图。",
+            kind="ok",
+        )
+
+    def _toggle_quad_editing(self, *, force_off: bool = False) -> None:
+        """进入/退出四角编辑态。进入时若已拉平，从已存的 quad 继续调。"""
+        photo = self._photo()
+        if photo is None or photo.image is None:
+            self._set_status(
+                "先选中一张已读入的图片，再开始透视拉平（识别会自动读图）。", kind="warning"
+            )
+            return
+        if force_off or self._quad_editing:
+            self._quad_editing = False
+            self.canvas.set_quad_mode(False)
+            self.btn_quad.setText("透视拉平…")
+            self._update_canvas_hint()
+            self._update_canvas()
+            return
+
+        if self._task_in_flight():
+            self._set_status("还有任务在跑，等它结束再拉平。", kind="warning")
+            return
+
+        self._quad_editing = True
+        self.canvas.set_quad_mode(True)
+        if photo.quad is not None:
+            # 已拉平过：把已存的四个角点放回画布上继续调
+            self.canvas.set_quad_points(list(photo.quad))
+        self.btn_quad.setText("重新框选角点")
+        self._update_canvas_hint()
+        self._update_canvas()
+        self._set_status(
+            "透视拉平：拖四个角点围住要拉平的区域，松手即应用；Esc 或再点按钮退出。"
+        )
+
+    def _on_quad_dragged(self, points: list) -> None:
+        """拖角点过程中的实时反馈：只报状态，不动数据。"""
+        self._set_status("正在调整拉平四角…松手即应用。")
+
+    def _on_quad_committed(self, points: list) -> None:
+        """四个角点拖好了（松手）：应用透视拉平（D9 融合管线第一步）。"""
+        photo = self._photo()
+        if photo is None or len(points) != 4:
+            return
+        self._apply_quad(photo, tuple((float(x), float(y)) for x, y in points))
+        self._set_status(
+            "已按四角透视拉平：请在拉平结果上重新取景（拖框或识别）。不满意可继续拖角点或撤销。"
+        )
+
+    def _apply_quad(self, photo: Photo, quad: tuple) -> None:
+        """把四个角点落库：生成拉平图，成品范围自动就位（UI-007"同步"）。
+
+        拉平后**成品 = 整个拉平区域**（D9："拉平结果就是成品范围，二次构图
+        交给拉平后的裁剪框"）—— 用户不需要再拖一遍框，所见即所得；想二次
+        构图直接在拉平结果上把框拖小即可。旧的取景框属于拉平前的坐标系，
+        一律作废。
+        """
+        photo.quad = quad
+        photo.rectified_image = None  # 缓存作废，下次取用时按新 quad 重新拉平
+        # 掩膜是原图坐标的，拉平后坐标系对不上（D9 纪律）—— 直接作废
+        photo.mask = None
+        size = quad_output_size(list(quad))
+        photo.subject_src = None
+        photo.pick_box = None
+        photo.pick_score = None
+        photo.free_src = Box(0, 0, size[0], size[1])
+        photo.rotated_image = None
+        photo.rotated_angle = 0.0
+        self._set_subject(photo, None)
+        self._set_free(photo, photo.free_src)
+        self._refresh_row(self._current)
+        self._update_canvas()
+        self._update_param_labels()
+
+    def _map_box_to_rectified(self, photo: Photo, box: Box) -> Box | None:
+        """原图坐标 -> 拉平图坐标（quad_homography 的轴对齐包围盒）。"""
+        if photo.quad is None or photo.image is None:
+            return box
+        try:
+            size = quad_output_size(list(photo.quad))
+            coeffs = quad_homography(list(photo.quad), size)
+            return map_box_by_homography(coeffs, box)
+        except Exception as exc:  # noqa: BLE001 - 四边形退化时给出明确提示而不是悄悄丢框
+            self._set_status(f"框映射到拉平图失败：{exc}，请重新拖框取景。", kind="warning")
+            return None
+
+    def _undo_quad(self) -> None:
+        """撤销拉平：回原图，框与识别结果作废（坐标系换了，留着只会骗人）。"""
+        photo = self._photo()
+        if photo is None or photo.quad is None:
+            self._set_status("这张图还没有应用透视拉平。", kind="info")
+            return
+        photo.quad = None
+        photo.rectified_image = None
+        photo.mask = None
+        photo.subject_src = None
+        photo.subject = None
+        photo.free_src = None
+        photo.free = None
+        photo.pick_box = None
+        photo.pick_score = None
+        photo.rotated_image = None
+        photo.rotated_angle = 0.0
+        photo.origin = "待识别"
+        photo.status = "已撤销拉平"
+        if self._quad_editing:
+            self._toggle_quad_editing(force_off=True)
+        self._refresh_row(self._current)
+        self._update_canvas()
+        self._update_candidate_combo()
+        self._update_param_labels()
+        self._set_status("已撤销透视拉平：回到原图，请重新识别或拖框取景。")
 
     # ==================================================================
     # 手动框 / 点选 / 锁定
@@ -1692,7 +1824,7 @@ class MainWindow(QMainWindow):
         """拖出一个框，松手了 —— 按当前模式决定这个框是什么。
 
         画布给的是"当前旋转角坐标系"里的框：显示就用它（原样，别让用户看到
-        框自己变大），同时换算一份原图坐标存起来 —— 将来改角度时要从这一份
+        框自己变大），同时换算一份工作图坐标存起来 —— 将来改角度时要从这一份
         重新算。
         """
         photo = self._photo()
@@ -1727,7 +1859,6 @@ class MainWindow(QMainWindow):
         self._refresh_row(self._current)
         self._update_canvas()
         self._update_param_labels()
-        self._refresh_size_hint()
         self._set_status(hint)
 
     def _on_pick_clicked(self, x: float, y: float) -> None:
@@ -1740,8 +1871,8 @@ class MainWindow(QMainWindow):
                 "这张图还没读进来，暂时点不了：先点「识别主体」把它读进来。", kind="warning"
             )
             return
-        if self._pick_thread is not None:
-            self._set_status("上一次点选还在计算，请稍候。", kind="info")
+        if self._task_in_flight() or self._pick_thread is not None:
+            self._set_status("还有任务在跑，等它结束再点选。", kind="info")
             return
         if "efficientsam-ti" in missing_models():
             self._set_status("缺少 EfficientSAM 模型，无法点选。", kind="danger")
@@ -1749,15 +1880,32 @@ class MainWindow(QMainWindow):
 
         # 提示点是累积的：前景点说"要这个"，背景点（右键）说"不要这块"，
         # 模型据此把选多了的区域推开 —— 比清空重来更好用。
-        points = list(self.canvas.picks)
-        labels = list(self.canvas.pick_labels)
+        # 提示点画在画布（旋转后）坐标系里：转回工作图坐标再发给模型，
+        # 否则画面转了之后点选会整体错位。
+        angle = self._rotation_angle(photo)
+        rotated = self._rotated_view(photo)
+        work = photo.work_image
+        points = []
+        labels = []
+        for (px, py), label in zip(self.canvas.picks, self.canvas.pick_labels):
+            if rotated is not None and work is not None and abs(angle) > 1e-6:
+                point_box = rotate_box(
+                    Box(round(px), round(py), round(px) + 1, round(py) + 1),
+                    rotated.size,
+                    work.size,
+                    -angle,
+                )
+                points.append((float(point_box.x1), float(point_box.y1)))
+            else:
+                points.append((px, py))
+            labels.append(label)
         negatives = sum(1 for label in labels if label < 0.5)
 
-        self._busy = True
+        self._set_busy(True)
         self._set_status(
             f"正在按你的点击分割（{len(points) - negatives} 个前景点、{negatives} 个背景点）…"
         )
-        worker = PickWorker(self._current, photo.image, points, labels, self._sam)
+        worker = PickWorker(self._current, photo.work_image, points, labels, self._sam)
         thread = QThread(self)
         worker.moveToThread(thread)
         thread.started.connect(worker.run)
@@ -1786,14 +1934,15 @@ class MainWindow(QMainWindow):
     @staticmethod
     def _hit_is_background(box: Box, photo: Photo) -> bool:
         """这次点选是不是"把整幅画面都选上了"（= 点在了背景上）。"""
-        if photo.image is None:
+        work = photo.work_image
+        if work is None:
             return False
-        width, height = photo.image.size
+        width, height = work.size
         share = (box.width * box.height) / max(1, width * height)
         return share >= BACKGROUND_PICK_SHARE
 
     def _on_pick_finished(self, index: int, hit) -> None:
-        self._busy = False
+        self._set_busy(False)
         photo = self._photos[index]
         if hit is None:
             self._set_status("这一点上没找到物体，换个位置再点。", kind="warning")
@@ -1809,12 +1958,13 @@ class MainWindow(QMainWindow):
             return
         photo.pick_box = hit.box
         photo.pick_score = float(hit.score)
-        # 掩膜换回原图空间再存：倾斜校正要用它估朝向，模型空间那份会算歪
-        photo.mask = hit.source_mask()
+        # 掩膜换回工作图空间再存：倾斜校正要用它估朝向。
+        # quad 给定时掩膜坐标系对不上，直接不存（rectify_tilt 会让位）。
+        photo.mask = None if photo.quad is not None else hit.source_mask()
         photo.manual = True
         photo.origin = "点选"
         photo.status = f"点选（置信度 {hit.score:.2f}）"
-        # hit.box 是原图坐标：src 存它，显示值按当前旋转角算
+        # hit.box 是工作图坐标：src 存它，显示值按当前旋转角算
         self._set_subject(photo, hit.box)
         self._set_free(photo, None)
         self._refresh_row(index)
@@ -1828,7 +1978,7 @@ class MainWindow(QMainWindow):
         )
 
     def _on_pick_failed(self, index: int, message: str) -> None:
-        self._busy = False
+        self._set_busy(False)
         self._set_status(f"点选失败：{message}", kind="danger")
 
     def _apply_current_box_to_all(self) -> None:
@@ -1846,21 +1996,25 @@ class MainWindow(QMainWindow):
             self._set_status("当前图片还没有可应用的裁剪框。", kind="warning")
             return
 
-        # 比例要拿**原图坐标**去算：显示框已经在旋转后坐标系里，而旋转画布
-        # 比原图大，用它除原图尺寸会把框算小。
+        # 比例要拿**工作图坐标**去算：显示框已经在旋转后坐标系里，而旋转画布
+        # 比工作图大，用它除工作图尺寸会把框算小。
         box_src = self._to_source_box(photo, box)
         if box_src is None:
             self._set_status("当前图片还没有可应用的裁剪框。", kind="warning")
             return
         angle = photo.rotate_deg
-        width, height = photo.image.size
+        work = photo.work_image
+        if work is None:
+            return
+        width, height = work.size
         rect = (box_src.x1 / width, box_src.y1 / height, box_src.x2 / width, box_src.y2 / height)
 
         applied = 0
         for index, target in enumerate(self._photos):
-            if target.image is None:
+            target_work = target.work_image
+            if target_work is None:
                 continue
-            tw, th = target.image.size
+            tw, th = target_work.size
             target_box = Box(
                 round(rect[0] * tw), round(rect[1] * th),
                 round(rect[2] * tw), round(rect[3] * th),
@@ -1919,6 +2073,22 @@ class MainWindow(QMainWindow):
         self._set_status(f"已从清单移除 {count} 张图。")
 
     def _clear_all(self) -> None:
+        """清空清单（P0-4：加确认 —— 一键下去丢的是整批复核工作量）。"""
+        if not self._photos:
+            self._set_status("清单已经是空的。", kind="info")
+            return
+        box = MessageBox(
+            "清空清单",
+            f"将移除清单里的 {len(self._photos)} 张图片，\n"
+            "识别结果、手动框、旋转角、透视拉平与排除标记全部丢弃。\n\n"
+            "原图不受影响，但批量复核的工作量要重来。确定清空吗？",
+            self,
+        )
+        box.yesButton.setText("清空")
+        box.cancelButton.setText("先不清")
+        if not box.exec():
+            self._set_status("已保留清单。", kind="info")
+            return
         self._photos.clear()
         self._current = -1
         self._reload_list()
@@ -1952,30 +2122,8 @@ class MainWindow(QMainWindow):
             self.edit_name.setText(str(template))
 
     def _output_spec(self) -> OutputSpec:
-        mode, unit = self.combo_unit.currentData()
-        limit = self.spin_limit.value()
-        width = self.spin_width.value() or None
-        height = self.spin_height.value() or None
-
-        if mode is SizeMode.PIXELS:
-            px_width = int(round(width)) if width else None
-            px_height = int(round(height)) if height else None
-            phys_width = phys_height = None
-        else:
-            px_width = px_height = None
-            phys_width, phys_height = width, height
-
+        """落盘三件套（1.1.0 瘦身）：目录、命名、同名策略。"""
         return OutputSpec(
-            size_mode=mode,
-            phys_unit=unit or Unit.CM,
-            phys_width=phys_width,
-            phys_height=phys_height,
-            px_width=px_width,
-            px_height=px_height,
-            dpi=self.spin_dpi.value(),
-            keep_aspect=self.switch_lock.isChecked(),
-            fmt=OutputFormat(self.combo_format.currentData()),
-            max_bytes=int(limit * 1024 * 1024) if limit > 0 else None,
             output_dir=Path(self.edit_out.text().strip()) if self.edit_out.text().strip() else None,
             name_template=self.edit_name.text().strip() or "{stem}_crop",
             on_conflict=ConflictPolicy(self.combo_conflict.currentData()),
@@ -2008,7 +2156,7 @@ class MainWindow(QMainWindow):
         self._run_export([photo], "导出当前")
 
     def _run_export(self, photos: list[Photo], task_name: str) -> None:
-        if self._busy or self._export_thread is not None:
+        if self._task_in_flight():
             self._set_status("还有任务在跑，请稍候。", kind="warning")
             return
         if not photos:
@@ -2035,7 +2183,7 @@ class MainWindow(QMainWindow):
         plans = {photo.path: self._plan_for(photo) for photo in photos}
         plans = {path: plan for path, plan in plans.items() if plan is not None}
 
-        self._busy = True
+        self._set_busy(True)
         self.btn_export.setEnabled(False)
         self.btn_export_current.setEnabled(False)
         self._set_status(f"正在导出 {len(plans)} 张…")
@@ -2059,6 +2207,8 @@ class MainWindow(QMainWindow):
     def _clear_export_refs(self) -> None:
         self._export_thread = None
         self._export_worker = None
+        self.btn_export.setEnabled(True)
+        self.btn_export_current.setEnabled(True)
 
     def _on_export_progress(self, done: int, total: int, name: str) -> None:
         self.progress.setRange(0, max(1, total))
@@ -2066,11 +2216,8 @@ class MainWindow(QMainWindow):
         self._set_status(f"正在导出（{done + 1}/{total}）：{name}")
 
     def _on_export_finished(self, report) -> None:
-        self._busy = False
-        self.btn_export.setEnabled(True)
-        self.btn_export_current.setEnabled(True)
+        self._set_busy(False)
         self.progress.setRange(0, 100)
-        self.progress.setValue(100)
 
         sizes = report.pixel_sizes()
         lines = [f"成功 {report.ok_count} 张，失败 {report.fail_count} 张。"]
@@ -2078,7 +2225,7 @@ class MainWindow(QMainWindow):
             picked = "、".join(f"{w}×{h}" for w, h in sorted(sizes))
             lines.append(
                 f"输出出现了 {len(sizes)} 种尺寸（{picked}）。"
-                "要整批完全一致：解锁「锁定原比例」并填好宽和高，"
+                "成品尺寸由每张图的取景框决定 —— 要整批一致，把各图的框框成同一个形状，"
                 "或在「比例」里选一个固定比例（例如 4:3）。"
             )
         failed = [result for result in report.results if not result.ok]
@@ -2087,21 +2234,33 @@ class MainWindow(QMainWindow):
             lines.extend(f"  · {result.source.name}：{result.error}" for result in failed[:10])
         warned = [result for result in report.results if result.warnings]
         if warned:
-            lines.append(f"（{len(warned)} 张带提示，例如补背景、非等比放大）")
+            lines.append(f"（{len(warned)} 张带提示，例如补背景、格式/透明通道转换）")
 
-        self._set_status(" ".join(lines), kind="danger" if failed else "ok")
+        if self._cancel_requested:
+            self._set_status(f"已取消导出：完成 {report.ok_count} 张（已落盘的文件保留）。", kind="warning")
+        else:
+            self._set_status(" ".join(lines), kind="danger" if failed else "ok")
 
+        # P1-3：结果面板 —— 统计 + 失败明细 + 直达输出目录的按钮
         first = next((result.out_path for result in report.results if result.out_path), None)
         content = "\n".join(lines)
         if first is not None:
             content += f"\n\n输出目录：{first.parent}"
         box = MessageBox("导出完成" if not failed else "导出有失败项", content, self)
+        if first is not None:
+            box.yesButton.setText("打开输出目录")
+            box.cancelButton.setText("关闭")
+            target_dir = first.parent
+            box.yesButton.clicked.connect(
+                lambda: QDesktopServices.openUrl(QUrl.fromLocalFile(str(target_dir)))
+            )
+        else:
+            box.yesButton.setText("知道了")
+            box.cancelButton.hide()
         box.exec()
 
     def _on_export_failed(self, message: str) -> None:
-        self._busy = False
-        self.btn_export.setEnabled(True)
-        self.btn_export_current.setEnabled(True)
+        self._set_busy(False)
         self._set_status(f"导出失败：{message}", kind="danger")
         InfoBar.error(
             title="导出失败",

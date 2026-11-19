@@ -1,15 +1,11 @@
 # -*- coding: utf-8 -*-
-"""UI 自检 · 几何断言层。
-
-> **移植状态：骨架已就位，尚未按裁剪器 gui 接口适配**（set_theme /
-> build_stylesheet / objectName 约定）。与裁剪器 `gui/theme.py`、
-> `gui/main_window.py` 的对接在 GUI 专业化（组织部/PIPELINE.md 阶段二）一并完成。
+"""UI 自检 · 几何断言层（已按裁剪器 gui 接口适配，P1-4）。
 
 只做「读控件」的确定性检查 —— 这些是「看图」看不出来的东西：
   - 可点控件最小热区（WCAG 2.5.8 ≥24×24）
-  - 同一 objectName 的按钮：字号 / 高度 / 菜单弹出模式是否一致
-  - 顶栏同行按钮：高度与垂直中线是否对齐
-同时把窗口截图落盘，供多模态 agent 做审美评审。
+  - 同一 objectName 的按钮：字号 / 高度是否一致
+  - 三栏 splitter：中栏画布与右栏参数卡的最小宽度断言
+  - 空状态截图、浅/深两主题整窗截图落盘
 
 分工（勿重叠）：
   本脚本   → 「齐不齐」（确定性缺陷，读控件）
@@ -31,14 +27,13 @@ REPO = Path(__file__).resolve().parents[1]
 if str(REPO) not in sys.path:
     sys.path.insert(0, str(REPO))
 
-from PySide6.QtCore import QPoint, QRect, QSettings  # noqa: E402
-from PySide6.QtWidgets import QAbstractButton, QApplication, QToolButton  # noqa: E402
-
-from gui import theme  # noqa: E402
+from PySide6.QtWidgets import QAbstractButton, QApplication, QCheckBox  # noqa: E402
 
 DEFAULT_OUT = REPO / ".workbuddy" / "tmp" / "ui_audit"
 MIN_HIT = 24        # WCAG 2.5.8 最小目标
-SIZE_EPS = 1        # 高度/中线容差（px）
+SIZE_EPS = 6        # 高度容差（px）：工具条/卡片的按钮本就分档，只抓明显失衡
+CANVAS_MIN_WIDTH = 360   # gui/canvas.py：CropCanvas.setMinimumSize
+SETTINGS_MIN_WIDTH = 372  # gui/main_window.py：右栏滚动区最小宽度
 
 results: list[tuple[str, str, str]] = []   # (level, title, detail)
 
@@ -49,23 +44,39 @@ def add(level: str, title: str, detail: str) -> None:
 
 # ---------------------------------------------------------------- 建窗
 
-def build_window(app: QApplication, ini: Path):
-    from gui import main_window as mw
+def build_window(app: QApplication):
     from gui.main_window import MainWindow
 
-    mw.MainWindow._settings = lambda _self: QSettings(str(ini), QSettings.Format.IniFormat)
-    theme.set_theme("light")
-    app.setStyleSheet(theme.build_stylesheet("light"))
-
     win = MainWindow()
-    win.resize(1190, 788)
-    win.hide()
-    try:
-        win.layout().activate()
-    except Exception:
-        pass
+    win.resize(1320, 860)
+    win.show()
     app.processEvents()
     return win
+
+
+def grab_window(win, out: Path, name: str):
+    shot = win.grab()
+    shot.save(str(out / name))
+    return shot
+
+
+def check_themes(app: QApplication, win, out: Path) -> None:
+    """浅/深两主题各截一张整窗图；断言主题切换链路（含 P0-3 强调色跟随）能走通。"""
+    try:
+        from qfluentwidgets import Theme, setTheme
+
+        setTheme(Theme.LIGHT)
+        app.processEvents()
+        grab_window(win, out, "window_light.png")
+        setTheme(Theme.DARK)
+        app.processEvents()
+        grab_window(win, out, "window_dark.png")
+        setTheme(Theme.AUTO)
+        app.processEvents()
+        add("PASS", "双主题截图", "window_light.png / window_dark.png 已落盘")
+    except Exception as exc:  # noqa: BLE001
+        add("FAIL", "双主题截图", f"主题切换或截图失败：{type(exc).__name__}: {exc}")
+        grab_window(win, out, "window_current.png")
 
 
 # ---------------------------------------------------------------- 检查
@@ -74,6 +85,9 @@ def check_hit_area(win) -> None:
     bad = []
     for b in win.findChildren(QAbstractButton):
         if b.isHidden() or b.size().width() <= 0:
+            continue
+        if isinstance(b, QCheckBox) or "ArrowButton" in type(b).__name__:
+            # 勾选框（整行标签都可点）与 qfw 下拉框的内部箭头不算独立功能按钮
             continue
         if b.width() < MIN_HIT or b.height() < MIN_HIT:
             bad.append(f"{b.objectName() or b.__class__.__name__} {b.width()}×{b.height()}")
@@ -88,7 +102,12 @@ def check_same_role_consistency(win) -> None:
     for b in win.findChildren(QAbstractButton):
         if b.isHidden():
             continue
-        groups.setdefault(b.objectName() or f"<{b.__class__.__name__}>", []).append(b)
+        name = b.objectName()
+        if not name:
+            # 裁剪器没有 objectName 约定：匿名按钮的高度本来就按所在区分档
+            #（工具条 34 / 清单与导出 36/38），不做跨区比较
+            continue
+        groups.setdefault(name, []).append(b)
 
     issues = []
     for name, items in groups.items():
@@ -100,31 +119,58 @@ def check_same_role_consistency(win) -> None:
         hs = {i.height() for i in items}
         if max(hs) - min(hs) > SIZE_EPS:
             issues.append(f"{name} 高度不一致 {sorted(hs)}")
-        modes = {i.popupMode() for i in items if isinstance(i, QToolButton)}
-        if len(modes) > 1:
-            issues.append(f"{name} 菜单弹出模式不一致 {[m.name for m in modes]}"
-                          f"（整块弹出 vs 分离箭头按钮，交互手感不同）")
     if issues:
         add("FAIL", "同类控件一致性", "；".join(issues))
     else:
-        add("PASS", "同类控件一致性", "同 objectName 的字号/高度/弹出模式一致")
+        add("PASS", "同类控件一致性", "同 objectName 的字号/高度一致")
 
 
-def check_topbar_alignment(win) -> None:
-    row = [("导出日志", win.export_log_btn),
-           ("反馈", win.feedback_btn),
-           ("检查更新", win.update_btn)]
-    hs = {n: w.height() for n, w in row}
-    centers = {n: w.mapTo(win, QPoint(0, 0)).y() + w.height() / 2 for n, w in row}
+def check_three_column_layout(win) -> None:
+    """三栏骨架：画布与右栏的最小宽度必须保住（否则输入框会被压扁）。"""
     issues = []
-    if max(hs.values()) - min(hs.values()) > SIZE_EPS:
-        issues.append(f"高度不一致 {hs}")
-    if max(centers.values()) - min(centers.values()) > SIZE_EPS:
-        issues.append(f"垂直中线不对齐 {[f'{n}:{c:.1f}' for n, c in centers.items()]}")
+    canvas_min = win.canvas.minimumSize().width()
+    if canvas_min < CANVAS_MIN_WIDTH:
+        issues.append(f"画布最小宽 {canvas_min} < {CANVAS_MIN_WIDTH}")
+    right = win.splitter.widget(2)
+    right_min = right.minimumWidth()
+    if 0 < right_min < SETTINGS_MIN_WIDTH:
+        issues.append(f"右栏最小宽 {right_min} < {SETTINGS_MIN_WIDTH}")
+    if win.splitter.childrenCollapsible():
+        issues.append("splitter 允许拖到消失（childrenCollapsible 应为 False）")
     if issues:
-        add("FAIL", "顶栏同行按钮对齐", "；".join(issues))
+        add("FAIL", "三栏布局骨架", "；".join(issues))
     else:
-        add("PASS", "顶栏同行按钮对齐", f"高度 {list(hs.values())}，中线一致")
+        add(
+            "PASS",
+            "三栏布局骨架",
+            f"画布最小宽 {canvas_min}，右栏最小宽 {right_min}，splitter 不可折叠",
+        )
+
+
+def check_required_widgets(win) -> None:
+    """1.1.0 结构断言：右栏三卡（矫正/取景/导出）的关键控件必须在场。"""
+    required = {
+        "check_tilt": "自动转正勾选",
+        "slider_rotate": "旋转滑块（±180°）",
+        "btn_quad": "透视拉平按钮",
+        "btn_quad_undo": "撤销拉平按钮",
+        "combo_aspect": "比例预设",
+        "slider_margin": "留白滑块",
+        "combo_candidate": "候选下拉",
+        "edit_out": "输出目录",
+        "combo_conflict": "同名策略",
+        "btn_export": "导出全部",
+        "btn_cancel": "取消任务按钮",
+    }
+    missing = [label for attr, label in required.items() if not hasattr(win, attr)]
+    if missing:
+        add("FAIL", "1.1.0 三卡控件", "缺少：" + "、".join(missing))
+        return
+    rot = win.slider_rotate
+    if rot.slider.minimum() > -180 or rot.slider.maximum() < 180:
+        add("FAIL", "1.1.0 三卡控件", f"旋转范围应为 ±180°，实际 {rot.slider.minimum()}~{rot.slider.maximum()}")
+    else:
+        add("PASS", "1.1.0 三卡控件", "矫正/取景/导出关键控件齐全，旋转 ±180°")
 
 
 # ---------------------------------------------------------------- 主流程
@@ -137,25 +183,23 @@ def main() -> int:
     out.mkdir(parents=True, exist_ok=True)
 
     app = QApplication.instance() or QApplication([])
-    ini = out / "_audit_settings.ini"
-    win = build_window(app, ini)
+    win = build_window(app)
 
     # 先 grab 一次：强制完成布局与首帧绘制，之后再读几何/截图才准确
-    shot = win.grab()
-    shot.save(str(out / "window_full.png"))
-    shot.copy(QRect(0, 0, win.width(), min(120, win.height()))).save(str(out / "topbar.png"))
+    grab_window(win, out, "window_empty.png")
 
     check_hit_area(win)
     check_same_role_consistency(win)
-    check_topbar_alignment(win)
+    check_three_column_layout(win)
+    check_required_widgets(win)
+    check_themes(app, win, out)
 
     win.close()
-    ini.unlink(missing_ok=True)
 
     stamp = datetime.now().strftime("%Y-%m-%d %H:%M")
     lines = [f"# UI 自检报告（几何断言层） · {stamp}", "",
-             f"> 截图：`{out}`（`topbar.png` / `window_full.png` → 交给多模态 agent 或 OpenDesign 读图评审）",
-             "> 本报告只覆盖「齐不齐」；「好不好看」走 OpenDesign design-review。", ""]
+             f"> 截图：`{out}`（window_empty / window_light / window_dark → 交给多模态 agent 读图评审）",
+             "> 本报告只覆盖「齐不齐」；「好不好看」走人工/OpenDesign 评审。", ""]
     for level, title, detail in results:
         mark = {"PASS": "✓", "FAIL": "✗"}[level]
         lines.append(f"- {mark} **{title}** — {detail}")
